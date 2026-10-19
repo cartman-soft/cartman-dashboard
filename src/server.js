@@ -6,6 +6,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const config = require('./config');
 const { db } = require('./db');
 const { seedDatabase } = require('./db/seed');
@@ -80,7 +81,11 @@ app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) {
     return next();
   }
-  res.sendFile(path.resolve(__dirname, '../public/index.html'));
+  const indexPath = path.resolve(__dirname, '../public/index.html');
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+  res.status(200).send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Cartman Dashboard</title></head><body><h1>Cartman Dashboard</h1><p>Public Demo Mode Active.</p></body></html>');
 });
 
 // Global Error Handler

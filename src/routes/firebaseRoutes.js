@@ -12,6 +12,19 @@ const { requireAuth } = require('../auth/middleware');
 const FIREBASE_CONFIG_PATH = path.resolve(__dirname, '../../data/firebase_config.json');
 
 function getStoredFirebaseConfig() {
+  if (config.isDemoMode || process.env.VERCEL) {
+    return {
+      apiKey: '',
+      authDomain: '',
+      projectId: '',
+      storageBucket: '',
+      messagingSenderId: '',
+      appId: '',
+      measurementId: '',
+      isConfigured: false
+    };
+  }
+
   try {
     if (fs.existsSync(FIREBASE_CONFIG_PATH)) {
       const raw = fs.readFileSync(FIREBASE_CONFIG_PATH, 'utf8');
@@ -36,7 +49,7 @@ function getStoredFirebaseConfig() {
 
 // GET /api/firebase/config - Get current Firebase config
 router.get('/config', (req, res) => {
-  if (config.isDemoMode) {
+  if (config.isDemoMode || process.env.VERCEL) {
     return res.json({
       success: true,
       data: {
@@ -64,6 +77,14 @@ router.get('/config', (req, res) => {
 
 // POST /api/firebase/config - Save Firebase configuration
 router.post('/config', requireAuth, (req, res) => {
+  if (config.isDemoMode || process.env.VERCEL) {
+    return res.status(403).json({
+      success: false,
+      isDemoLocked: true,
+      error: 'Disabled in Public Demo: Firebase configuration changes are locked in demo mode.'
+    });
+  }
+
   try {
     const { apiKey, authDomain, projectId, storageBucket, messagingSenderId, appId, measurementId } = req.body;
 

@@ -24,7 +24,17 @@ let testsFailed = 0;
 
 function it(description, fn) {
   try {
-    fn();
+    const res = fn();
+    if (res && typeof res.then === 'function') {
+      return res.then(() => {
+        console.log(`  ✓ ${description}`);
+        testsPassed++;
+      }).catch(err => {
+        console.error(`  ✗ ${description}`);
+        console.error(`    Error: ${err.message}`);
+        testsFailed++;
+      });
+    }
     console.log(`  ✓ ${description}`);
     testsPassed++;
   } catch (err) {
@@ -166,7 +176,7 @@ async function runAllTests() {
     assert.ok(!AuthService.verifyPassword('WrongPassword', hash));
   });
 
-  it('requires 6-digit OTP verification before issuing JWT session', async () => {
+  await it('requires 6-digit OTP verification before issuing JWT session', async () => {
     const res = await AuthService.initiateLogin({ email: 'admin@cartman.com', password: 'CartmanAdmin2026!' });
     assert.strictEqual(res.otpRequired, true);
     assert.ok(res.expiresInSeconds > 0);
@@ -451,6 +461,207 @@ async function runAllTests() {
     assert(vercelignore.includes('.env'), '.vercelignore must exclude .env');
     assert(vercelignore.includes('backup*/'), '.vercelignore must exclude backups');
     assert(vercelignore.includes('tests/'), '.vercelignore must exclude tests');
+  });
+
+  // Test Group 11: Vercel Read-Only Filesystem & Public Demo Startup
+  console.log('\n--- 11. Vercel Read-Only Filesystem & Public Demo Startup ---');
+
+  await it('boots database in-memory without filesystem calls when running in Vercel/demo mode', () => {
+    const { RelationalDatabase } = require('../src/db');
+    // Simulate non-writable /var/task path as in Vercel lambda
+    const vercelFakePath = 'Z:\\non_existent_readonly_volume\\var\\task\\data\\cartman_db.json';
+
+    // Instantiation must succeed without ENOENT or mkdirSync error
+    const vDb = new RelationalDatabase(vercelFakePath, { isDemoMode: true });
+    assert.strictEqual(vDb.isDemoMode, true);
+    assert.strictEqual(vDb.count(TABLES.USERS), 0);
+
+    // Saving must be a no-op that does not throw or create files
+    vDb.save();
+
+    // In-memory inserts must succeed cleanly
+    const testUser = vDb.insert(TABLES.USERS, {
+      email: 'demo@cartman.com',
+      fullName: 'Demo Test',
+      role: 'Staff',
+      passwordHash: 'dummy',
+      status: 'active'
+    });
+    assert.ok(testUser.id);
+    assert.strictEqual(vDb.count(TABLES.USERS), 1);
+  });
+
+  await it('populates safe deterministic demo dataset in-memory without touching disk', () => {
+    const { RelationalDatabase } = require('../src/db');
+    const { AccountRegistry } = require('../src/registry/accountRegistry');
+    const vDb = new RelationalDatabase('/var/task/data/cartman_db.json', { isDemoMode: true });
+
+    // Sync account registry
+    AccountRegistry.syncRegistryToDb(vDb);
+    assert.strictEqual(vDb.count(TABLES.MARKETPLACE_ACCOUNTS), 14, 'Must seed all 14 registered platform accounts');
+
+    // Verify accounts have no private credentials
+    const accounts = vDb.find(TABLES.MARKETPLACE_ACCOUNTS);
+    for (const acc of accounts) {
+      assert.strictEqual(acc.sellerId, null);
+      assert.ok(acc.credentialsJson === '{}' || acc.credentialsJson === undefined);
+    }
+  });
+
+  await it('validates vercel.json includes public assets and prevents directory rewrite', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const vercelConfig = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../vercel.json'), 'utf8'));
+
+    // 1. Functions configuration includes public assets
+    assert.ok(vercelConfig.functions && vercelConfig.functions['api/index.js'], 'Must configure api/index.js functions');
+    assert.strictEqual(vercelConfig.functions['api/index.js'].includeFiles, 'public/**', 'Must bundle public/** in serverless function');
+
+    // 2. Rewrites route API to api/index.js and root/SPA to /index.html
+    const rewrites = vercelConfig.rewrites;
+    assert.ok(Array.isArray(rewrites), 'rewrites must be an array');
+
+    // Check that broken /public/$1 destination is removed
+    const brokenRewrite = rewrites.find(r => r.destination === '/public/$1');
+    assert.strictEqual(brokenRewrite, undefined, 'Must not rewrite to directory /public/$1');
+
+    // Check that /api routes point to /api/index.js
+    const apiRewrite = rewrites.find(r => r.source === '/api/(.*)' && r.destination === '/api/index.js');
+    assert.ok(apiRewrite, 'Must rewrite /api/(.*) to /api/index.js');
+
+    // Check SPA fallback to /index.html
+    const spaRewrite = rewrites.find(r => r.destination === '/index.html');
+    assert.ok(spaRewrite, 'Must rewrite non-api requests to /index.html');
+  });
+
+  await it('serves public read-only GET APIs and blocks all mutations over HTTP in demo mode', async () => {
+    const http = require('http');
+    const config = require('../src/config');
+    const { app } = require('../src/server');
+
+    const originalDemoMode = config.isDemoMode;
+    const originalReadOnly = config.isReadOnly;
+    config.isDemoMode = true;
+    config.isReadOnly = true;
+
+    // Helper for HTTP requests
+    function makeHttpCall(server, method, reqPath, data = null) {
+      return new Promise((resolve, reject) => {
+        const port = server.address().port;
+        const options = {
+          hostname: '127.0.0.1',
+          port,
+          path: reqPath,
+          method,
+          headers: {}
+        };
+        let bodyPayload = null;
+        if (data) {
+          bodyPayload = typeof data === 'object' ? JSON.stringify(data) : data;
+          options.headers['Content-Type'] = 'application/json';
+          options.headers['Content-Length'] = Buffer.byteLength(bodyPayload);
+        }
+        const req = http.request(options, (res) => {
+          let raw = '';
+          res.on('data', chunk => { raw += chunk; });
+          res.on('end', () => {
+            let json = null;
+            try { json = JSON.parse(raw); } catch (e) {}
+            resolve({ statusCode: res.statusCode, body: raw, json });
+          });
+        });
+        req.on('error', reject);
+        if (bodyPayload) req.write(bodyPayload);
+        req.end();
+      });
+    }
+
+    const testServer = http.createServer(app);
+    await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      // 1. GET / - SPA fallback should return HTTP 200 with HTML (not 500)
+      const rootRes = await makeHttpCall(testServer, 'GET', '/');
+      assert.strictEqual(rootRes.statusCode, 200, 'GET / must return HTTP 200');
+      assert.ok(rootRes.body.includes('Cartman'), 'GET / must return HTML containing Cartman');
+
+      // 2. GET /api/status - Public demo status
+      const statusRes = await makeHttpCall(testServer, 'GET', '/api/status');
+      assert.strictEqual(statusRes.statusCode, 200);
+      assert.strictEqual(statusRes.json.isDemoMode, true);
+      assert.strictEqual(statusRes.json.isReadOnly, true);
+
+      // 3. GET /api/auth/me - Public guest access without token
+      const meRes = await makeHttpCall(testServer, 'GET', '/api/auth/me');
+      assert.strictEqual(meRes.statusCode, 200);
+      assert.strictEqual(meRes.json.user.id, 'demo_guest');
+      assert.strictEqual(meRes.json.user.role, 'Admin');
+
+      // 4. GET /api/dashboard/overview - Valid demo metrics
+      const overviewRes = await makeHttpCall(testServer, 'GET', '/api/dashboard/overview');
+      assert.strictEqual(overviewRes.statusCode, 200);
+      assert.ok(overviewRes.json.data.grandTotals, 'Must return grand totals');
+
+      // 5. GET /api/accounts - Masked accounts list
+      const accountsRes = await makeHttpCall(testServer, 'GET', '/api/accounts');
+      assert.strictEqual(accountsRes.statusCode, 200);
+      assert.ok(Array.isArray(accountsRes.json.data));
+
+      // 6. GET /api/orders/summary - Order breakdown
+      const ordersRes = await makeHttpCall(testServer, 'GET', '/api/orders/summary');
+      assert.strictEqual(ordersRes.statusCode, 200);
+      assert.ok(ordersRes.json.companyStatusCounts);
+
+      // 7. GET /api/reconciliation/summary - Reconciliation overview
+      const reconRes = await makeHttpCall(testServer, 'GET', '/api/reconciliation/summary');
+      assert.strictEqual(reconRes.statusCode, 200);
+      assert.ok(reconRes.json.data.totals);
+
+      // 8. GET /api/firebase/config - Masked empty config
+      const fbRes = await makeHttpCall(testServer, 'GET', '/api/firebase/config');
+      assert.strictEqual(fbRes.statusCode, 200);
+      assert.strictEqual(fbRes.json.data.apiKey, '');
+      assert.strictEqual(fbRes.json.data.projectId, '');
+
+      // 9. GET /api/sales-report/accounts - Sales report accounts
+      const srAccRes = await makeHttpCall(testServer, 'GET', '/api/sales-report/accounts');
+      assert.strictEqual(srAccRes.statusCode, 200);
+      assert.ok(Array.isArray(srAccRes.json.accounts));
+
+      // 10. POST mutations MUST ALL return HTTP 403 Forbidden
+      const postLogin = await makeHttpCall(testServer, 'POST', '/api/auth/login', { email: 'admin@cartman.com', password: 'xyz' });
+      assert.strictEqual(postLogin.statusCode, 403, 'POST /api/auth/login must be 403 in demo mode');
+
+      const postAccounts = await makeHttpCall(testServer, 'POST', '/api/accounts', { marketplace: 'amazon' });
+      assert.strictEqual(postAccounts.statusCode, 403, 'POST /api/accounts must be 403 in demo mode');
+
+      const postReconMatch = await makeHttpCall(testServer, 'POST', '/api/reconciliation/match', { bankTransactionId: '1', settlementId: '2' });
+      assert.strictEqual(postReconMatch.statusCode, 403, 'POST /api/reconciliation/match must be 403 in demo mode');
+
+      const postUsers = await makeHttpCall(testServer, 'POST', '/api/users', { email: 'new@cartman.com' });
+      assert.strictEqual(postUsers.statusCode, 403, 'POST /api/users must be 403 in demo mode');
+
+      const postFirebase = await makeHttpCall(testServer, 'POST', '/api/firebase/config', { apiKey: 'key', projectId: 'proj' });
+      assert.strictEqual(postFirebase.statusCode, 403, 'POST /api/firebase/config must be 403 in demo mode');
+
+    } finally {
+      config.isDemoMode = originalDemoMode;
+      config.isReadOnly = originalReadOnly;
+      await new Promise(resolve => testServer.close(resolve));
+    }
+  });
+
+  await it('preserves local development business database without modification', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const dbPath = path.resolve(__dirname, '../data/cartman_db.json');
+    if (fs.existsSync(dbPath)) {
+      const stats = fs.statSync(dbPath);
+      assert.ok(stats.size > 0, 'Local cartman_db.json file must not be empty');
+      const raw = fs.readFileSync(dbPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      assert.ok(parsed, 'Local cartman_db.json must contain valid JSON');
+    }
   });
 
   console.log('\n=======================================================');

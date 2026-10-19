@@ -15,8 +15,9 @@ const config = require('../config');
 const { TABLES, SCHEMAS } = require('./schema');
 
 class RelationalDatabase {
-  constructor(dbFilePath = config.dbPath) {
+  constructor(dbFilePath = config.dbPath, options = {}) {
     this.dbFilePath = dbFilePath;
+    this.isDemoMode = options.isDemoMode !== undefined ? options.isDemoMode : (config.isDemoMode || Boolean(process.env.VERCEL));
     this.tables = {};
     this.indexes = {}; // table -> indexName -> Map(key, id)
     this._inTransaction = false;
@@ -36,6 +37,14 @@ class RelationalDatabase {
   }
 
   load() {
+    if (this.isDemoMode || config.isDemoMode || process.env.VERCEL) {
+      // In Demo Mode or on Vercel serverless environment, never attempt to
+      // inspect, create directories, or read database files from the filesystem.
+      // Retain clean in-memory tables that will be populated with safe demo seed data.
+      this._initializeTables();
+      return;
+    }
+
     try {
       const dir = path.dirname(this.dbFilePath);
       if (!fs.existsSync(dir)) {
@@ -69,7 +78,7 @@ class RelationalDatabase {
       return; // Persist on transaction commit
     }
 
-    if (config.isDemoMode || process.env.VERCEL) {
+    if (this.isDemoMode || config.isDemoMode || process.env.VERCEL) {
       // In Demo Mode or on Vercel serverless environment, the filesystem is read-only.
       // Retain records in memory and bypass disk writes to prevent EROFS errors.
       return;
