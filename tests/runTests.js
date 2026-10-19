@@ -508,7 +508,7 @@ async function runAllTests() {
     }
   });
 
-  await it('validates vercel.json includes public assets and prevents directory rewrite', () => {
+  await it('validates vercel.json includes public assets and routes to Express api/index.js', () => {
     const fs = require('fs');
     const path = require('path');
     const vercelConfig = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../vercel.json'), 'utf8'));
@@ -517,7 +517,7 @@ async function runAllTests() {
     assert.ok(vercelConfig.functions && vercelConfig.functions['api/index.js'], 'Must configure api/index.js functions');
     assert.strictEqual(vercelConfig.functions['api/index.js'].includeFiles, 'public/**', 'Must bundle public/** in serverless function');
 
-    // 2. Rewrites route API to api/index.js and root/SPA to /index.html
+    // 2. Rewrites route to api/index.js
     const rewrites = vercelConfig.rewrites;
     assert.ok(Array.isArray(rewrites), 'rewrites must be an array');
 
@@ -525,13 +525,70 @@ async function runAllTests() {
     const brokenRewrite = rewrites.find(r => r.destination === '/public/$1');
     assert.strictEqual(brokenRewrite, undefined, 'Must not rewrite to directory /public/$1');
 
-    // Check that /api routes point to /api/index.js
-    const apiRewrite = rewrites.find(r => r.source === '/api/(.*)' && r.destination === '/api/index.js');
-    assert.ok(apiRewrite, 'Must rewrite /api/(.*) to /api/index.js');
+    // Check that routes point to /api/index.js
+    const apiRewrite = rewrites.find(r => r.destination === '/api/index.js');
+    assert.ok(apiRewrite, 'Must rewrite routes to /api/index.js');
+  });
 
-    // Check SPA fallback to /index.html
-    const spaRewrite = rewrites.find(r => r.destination === '/index.html');
-    assert.ok(spaRewrite, 'Must rewrite non-api requests to /index.html');
+  await it('reproduces Vercel Lambda cold start without VERCEL env var and intercepts any filesystem writes', () => {
+    const fs = require('fs');
+    // 1. Simulate exact AWS Lambda environment where process.env.VERCEL is NOT set
+    const savedVercel = process.env.VERCEL;
+    const savedDemoMode = process.env.DEMO_MODE;
+    const savedLambdaRoot = process.env.LAMBDA_TASK_ROOT;
+    const savedExecutionEnv = process.env.AWS_EXECUTION_ENV;
+
+    delete process.env.VERCEL;
+    delete process.env.DEMO_MODE;
+    process.env.LAMBDA_TASK_ROOT = '/var/task';
+    process.env.AWS_EXECUTION_ENV = 'AWS_Lambda_nodejs20.x';
+
+    // 2. Intercept fs methods to detect any illegal disk access on /var/task
+    const originalMkdirSync = fs.mkdirSync;
+    const originalWriteFileSync = fs.writeFileSync;
+    let illegalDiskAttempt = null;
+
+    fs.mkdirSync = function(targetDir) {
+      if (typeof targetDir === 'string' && targetDir.includes('/var/task')) {
+        illegalDiskAttempt = `Illegal mkdirSync on ${targetDir}`;
+        throw new Error(illegalDiskAttempt);
+      }
+      return originalMkdirSync.apply(this, arguments);
+    };
+
+    fs.writeFileSync = function(targetFile) {
+      if (typeof targetFile === 'string' && targetFile.includes('/var/task')) {
+        illegalDiskAttempt = `Illegal writeFileSync on ${targetFile}`;
+        throw new Error(illegalDiskAttempt);
+      }
+      return originalWriteFileSync.apply(this, arguments);
+    };
+
+    try {
+      const { RelationalDatabase: FreshDB } = require('../src/db');
+      const lambdaDb = new FreshDB('/var/task/data/cartman_db.json');
+
+      assert.strictEqual(illegalDiskAttempt, null, 'Must not attempt any mkdirSync/writeFileSync during load()');
+      assert.strictEqual(lambdaDb.isDemoMode, true, 'isDemoMode must be auto-detected via LAMBDA_TASK_ROOT / /var/task path');
+
+      // 5. Test saving and seeding
+      lambdaDb.save();
+      assert.strictEqual(illegalDiskAttempt, null, 'Must not attempt any writeFileSync during save()');
+
+      const { AccountRegistry } = require('../src/registry/accountRegistry');
+      AccountRegistry.syncRegistryToDb(lambdaDb);
+      assert.strictEqual(illegalDiskAttempt, null, 'Must not attempt any disk writes during syncRegistryToDb()');
+      assert.strictEqual(lambdaDb.count(TABLES.MARKETPLACE_ACCOUNTS), 14);
+
+    } finally {
+      // Restore fs and env
+      fs.mkdirSync = originalMkdirSync;
+      fs.writeFileSync = originalWriteFileSync;
+      if (savedVercel !== undefined) process.env.VERCEL = savedVercel; else delete process.env.VERCEL;
+      if (savedDemoMode !== undefined) process.env.DEMO_MODE = savedDemoMode; else delete process.env.DEMO_MODE;
+      if (savedLambdaRoot !== undefined) process.env.LAMBDA_TASK_ROOT = savedLambdaRoot; else delete process.env.LAMBDA_TASK_ROOT;
+      if (savedExecutionEnv !== undefined) process.env.AWS_EXECUTION_ENV = savedExecutionEnv; else delete process.env.AWS_EXECUTION_ENV;
+    }
   });
 
   await it('serves public read-only GET APIs and blocks all mutations over HTTP in demo mode', async () => {

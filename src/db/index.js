@@ -14,10 +14,29 @@ const crypto = require('crypto');
 const config = require('../config');
 const { TABLES, SCHEMAS } = require('./schema');
 
+function isReadOnlyServerlessPath(targetPath) {
+  if (config.isDemoMode || config.isReadOnly) {
+    return true;
+  }
+  if (process.env.VERCEL || process.env.VERCEL_ENV || process.env.VERCEL_REGION || process.env.NOW_REGION || process.env.LAMBDA_TASK_ROOT || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.AWS_EXECUTION_ENV) {
+    return true;
+  }
+  if (typeof targetPath === 'string' && (targetPath.includes('/var/task') || targetPath.includes('\\var\\task') || targetPath.includes('/var/runtime'))) {
+    return true;
+  }
+  if (typeof __dirname === 'string' && (__dirname.includes('/var/task') || __dirname.includes('\\var\\task'))) {
+    return true;
+  }
+  if (typeof process.cwd === 'function' && (process.cwd().includes('/var/task') || process.cwd().includes('\\var\\task'))) {
+    return true;
+  }
+  return false;
+}
+
 class RelationalDatabase {
   constructor(dbFilePath = config.dbPath, options = {}) {
     this.dbFilePath = dbFilePath;
-    this.isDemoMode = options.isDemoMode !== undefined ? options.isDemoMode : (config.isDemoMode || Boolean(process.env.VERCEL));
+    this.isDemoMode = options.isDemoMode !== undefined ? Boolean(options.isDemoMode) : (config.isDemoMode || isReadOnlyServerlessPath(this.dbFilePath));
     this.tables = {};
     this.indexes = {}; // table -> indexName -> Map(key, id)
     this._inTransaction = false;
@@ -37,7 +56,7 @@ class RelationalDatabase {
   }
 
   load() {
-    if (this.isDemoMode || config.isDemoMode || process.env.VERCEL) {
+    if (this.isDemoMode || config.isDemoMode || isReadOnlyServerlessPath(this.dbFilePath)) {
       // In Demo Mode or on Vercel serverless environment, never attempt to
       // inspect, create directories, or read database files from the filesystem.
       // Retain clean in-memory tables that will be populated with safe demo seed data.
@@ -78,7 +97,7 @@ class RelationalDatabase {
       return; // Persist on transaction commit
     }
 
-    if (this.isDemoMode || config.isDemoMode || process.env.VERCEL) {
+    if (this.isDemoMode || config.isDemoMode || isReadOnlyServerlessPath(this.dbFilePath)) {
       // In Demo Mode or on Vercel serverless environment, the filesystem is read-only.
       // Retain records in memory and bypass disk writes to prevent EROFS errors.
       return;
