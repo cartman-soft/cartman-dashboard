@@ -1,0 +1,69 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper function to check if request is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper function to check if user has Admin role
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'admin' ||
+        request.auth.token.role == 'Admin' ||
+        request.auth.token.admin == true
+      );
+    }
+
+    // Helper function to check if user has Accounts role
+    function isAccountsOrAdmin() {
+      return isAuthenticated() && (
+        isAdmin() ||
+        request.auth.token.role == 'accounts' ||
+        request.auth.token.role == 'Accounts'
+      );
+    }
+
+    // Orders Collection: Authenticated read; write restricted to Admin & Accounts
+    match /orders/{orderId} {
+      allow read: if isAuthenticated();
+      allow write: if isAccountsOrAdmin();
+    }
+
+    // Settlements Collection: Authenticated read; write restricted to Accounts & Admin
+    match /settlements/{settlementId} {
+      allow read: if isAuthenticated();
+      allow write: if isAccountsOrAdmin();
+    }
+
+    // Marketplace Accounts Collection: Authenticated read; write restricted to Admin
+    match /accounts/{accountId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Bank Transactions Collection: Restricted strictly to Accounts & Admin
+    match /bank_transactions/{txnId} {
+      allow read, write: if isAccountsOrAdmin();
+    }
+
+    // User Profiles Collection: Users can read/write their own; Admin has full access
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+    }
+
+    // Audit Logs Collection: Read-only for authenticated staff; write restricted
+    match /audit_logs/{logId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Append-only audit trail
+    }
+
+    // Default Fallback: Strictly deny all unauthenticated or unmapped collection access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

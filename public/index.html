@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CARTMAN — E-Commerce Sales & Payment Dashboard</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛒</text></svg>">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar" id="appSidebar">
+      <div class="brand-section">
+        <div class="brand-logo-badge">C</div>
+        <div>
+          <div class="brand-title">CARTMAN</div>
+          <div class="brand-sub">Sales & Payments</div>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <a class="nav-item active" data-view="dashboard">
+          <span class="nav-icon">📊</span>
+          <span>Dashboard</span>
+        </a>
+        <a class="nav-item" data-view="sales-upload">
+          <span class="nav-icon">📤</span>
+          <span>Sales Upload</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div style="font-weight: 600; color: var(--text-main);">Cartman Dashboard</div>
+        <div style="font-size: 11px; margin-top: 2px; color: var(--text-muted);">Financial Analytics</div>
+      </div>
+    </aside>
+
+    <!-- Main Content Wrapper -->
+    <div class="main-wrapper">
+      <!-- Top Sticky Header -->
+      <header class="top-header">
+        <div class="header-left">
+          <button class="mobile-menu-btn" id="mobileMenuBtn">☰</button>
+          <div class="page-title" id="pageTitle">Dashboard</div>
+        </div>
+
+        <div class="header-right">
+          <!-- User Info & Role -->
+          <div class="user-badge" id="userBadge">
+            <div class="user-avatar" id="userAvatar">A</div>
+            <span id="userName">Rajesh Sharma</span>
+            <span class="role-pill admin" id="userRole">Admin</span>
+          </div>
+
+          <button class="btn-logout" id="btnLogout" title="Sign out">Log Out</button>
+        </div>
+      </header>
+
+      <!-- Global Filter Toolbar -->
+      <div class="filter-toolbar">
+        <div class="filter-group">
+          <span style="font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase;">Period:</span>
+          <button class="btn-period" data-period="daily">Daily</button>
+          <button class="btn-period active" data-period="monthly">Monthly</button>
+          <button class="btn-period" data-period="custom">Custom Range</button>
+        </div>
+
+        <!-- Dynamic Date Controls -->
+        <div class="filter-group" id="dateInputsContainer">
+          <!-- Rendered dynamically by state: daily picker, month picker, or from-to -->
+        </div>
+
+        <div class="filter-group">
+          <button class="btn-secondary" id="btnRefresh" title="Refresh calculations">🔄 Refresh</button>
+          <button class="btn-primary" id="btnSyncNow" title="Trigger immediate marketplace sync">⚡ Sync Now</button>
+        </div>
+      </div>
+
+      <!-- Main View Content Area -->
+      <main class="view-content" id="viewContainer">
+        <!-- Views rendered dynamically by app router -->
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Global Modal Container -->
+  <div class="modal-overlay" id="appModal">
+    <div class="modal-card" id="modalCard">
+      <!-- Injected dynamically -->
+    </div>
+  </div>
+
+  <!-- Firebase Web SDK (Compat mode for zero-build direct browser execution) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+  <!-- Application Scripts -->
+  <script src="/js/api.js"></script>
+  <script src="/js/state.js"></script>
+  <script src="/js/firebase-config.js"></script>
+  <script src="/js/firebaseService.js"></script>
+  <script src="/js/components/dashboardView.js"></script>
+  <script src="/js/components/salesReportUploadView.js"></script>
+  <script src="/js/components/accountsView.js"></script>
+  <script src="/js/components/ordersView.js"></script>
+  <script src="/js/components/reconciliationView.js"></script>
+  <script src="/js/components/bankImportView.js"></script>
+  <script src="/js/components/reportsView.js"></script>
+  <script src="/js/components/usersView.js"></script>
+  <script src="/js/components/integrationsView.js"></script>
+  <script src="/js/components/settingsView.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
