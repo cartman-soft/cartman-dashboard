@@ -65,24 +65,22 @@ class RelationalDatabase {
     }
 
     try {
-      const dir = path.dirname(this.dbFilePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      if (!fs.existsSync(this.dbFilePath)) {
+        this._initializeTables();
+        return;
       }
 
-      if (fs.existsSync(this.dbFilePath)) {
-        const raw = fs.readFileSync(this.dbFilePath, 'utf8');
-        const data = JSON.parse(raw);
+      const raw = fs.readFileSync(this.dbFilePath, 'utf8');
+      const data = JSON.parse(raw);
 
-        for (const tableName of Object.values(TABLES)) {
-          this.tables[tableName] = new Map();
-          this.indexes[tableName] = { byId: new Map() };
+      for (const tableName of Object.values(TABLES)) {
+        this.tables[tableName] = new Map();
+        this.indexes[tableName] = { byId: new Map() };
 
-          if (Array.isArray(data[tableName])) {
-            for (const record of data[tableName]) {
-              this.tables[tableName].set(record.id, record);
-              this.indexes[tableName].byId.set(record.id, record);
-            }
+        if (Array.isArray(data[tableName])) {
+          for (const record of data[tableName]) {
+            this.tables[tableName].set(record.id, record);
+            this.indexes[tableName].byId.set(record.id, record);
           }
         }
       }

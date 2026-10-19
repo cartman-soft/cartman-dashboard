@@ -525,9 +525,36 @@ async function runAllTests() {
     const brokenRewrite = rewrites.find(r => r.destination === '/public/$1');
     assert.strictEqual(brokenRewrite, undefined, 'Must not rewrite to directory /public/$1');
 
-    // Check that routes point to /api/index.js
-    const apiRewrite = rewrites.find(r => r.destination === '/api/index.js');
-    assert.ok(apiRewrite, 'Must rewrite routes to /api/index.js');
+    // Check that API routes point to /api/index.js
+    const apiRewrite = rewrites.find(r => r.source === '/api/(.*)' && r.destination === '/api/index.js');
+    assert.ok(apiRewrite, 'Must rewrite /api/(.*) routes to /api/index.js');
+
+    // Check that SPA fallback points to /index.html and NOT /api/index.js (which breaks root / on Vercel)
+    const spaRewrite = rewrites.find(r => r.source === '/(.*)' && r.destination === '/index.html');
+    assert.ok(spaRewrite, 'Must rewrite /(.*) to /index.html so Vercel CDN serves public/index.html');
+    const brokenRootRewrite = rewrites.find(r => r.source === '/(.*)' && r.destination === '/api/index.js');
+    assert.strictEqual(brokenRootRewrite, undefined, 'Must not rewrite root /(.*) to /api/index.js');
+  });
+
+  await it('regression test: RelationalDatabase.load() never calls fs.mkdirSync on non-existent path regardless of flags', () => {
+    const fs = require('fs');
+    const { RelationalDatabase } = require('../src/db');
+
+    let mkdirAttempted = false;
+    const origMkdirSync = fs.mkdirSync;
+    fs.mkdirSync = function() {
+      mkdirAttempted = true;
+      return origMkdirSync.apply(this, arguments);
+    };
+
+    try {
+      const nonExistentPath = 'Z:\\non_existent_drive\\random_folder_' + Date.now() + '\\cartman_db.json';
+      const testDb = new RelationalDatabase(nonExistentPath, { isDemoMode: false });
+      assert.strictEqual(mkdirAttempted, false, 'load() must NEVER attempt fs.mkdirSync when file does not exist');
+      assert.strictEqual(testDb.count(TABLES.USERS), 0, 'Tables must be initialized empty in memory');
+    } finally {
+      fs.mkdirSync = origMkdirSync;
+    }
   });
 
   await it('reproduces Vercel Lambda cold start without VERCEL env var and intercepts any filesystem writes', () => {
