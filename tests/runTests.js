@@ -521,19 +521,22 @@ async function runAllTests() {
     const rewrites = vercelConfig.rewrites;
     assert.ok(Array.isArray(rewrites), 'rewrites must be an array');
 
-    // Check that broken /public/$1 destination is removed
-    const brokenRewrite = rewrites.find(r => r.destination === '/public/$1');
-    assert.strictEqual(brokenRewrite, undefined, 'Must not rewrite to directory /public/$1');
+    // Check that broken /public/ destinations are removed
+    const brokenRewrite = rewrites.find(r => r.destination === '/public/$1' || r.destination === '/public/index.html');
+    assert.strictEqual(brokenRewrite, undefined, 'Must not rewrite to directory /public/$1 or /public/index.html');
 
     // Check that API routes point to /api/index.js
     const apiRewrite = rewrites.find(r => r.source === '/api/(.*)' && r.destination === '/api/index.js');
     assert.ok(apiRewrite, 'Must rewrite /api/(.*) routes to /api/index.js');
 
-    // Check that SPA fallback points to /index.html and NOT /api/index.js (which breaks root / on Vercel)
-    const spaRewrite = rewrites.find(r => r.source === '/(.*)' && r.destination === '/index.html');
-    assert.ok(spaRewrite, 'Must rewrite /(.*) to /index.html so Vercel CDN serves public/index.html');
-    const brokenRootRewrite = rewrites.find(r => r.source === '/(.*)' && r.destination === '/api/index.js');
-    assert.strictEqual(brokenRootRewrite, undefined, 'Must not rewrite root /(.*) to /api/index.js');
+    // Check that SPA fallback points to /index.html and NOT /api/index.js or /public/index.html
+    const spaRewrite = rewrites.find(r => r.destination === '/index.html');
+    assert.ok(spaRewrite, 'Must rewrite frontend paths to /index.html so Vercel CDN serves public/index.html');
+    assert.strictEqual(spaRewrite.destination, '/index.html', 'Destination must be /index.html (not /public/index.html)');
+
+    // Ensure root / is not rewritten in vercel.json to avoid edge rewrite loop
+    const brokenRootRewrite = rewrites.find(r => (r.source === '/(.*)' || r.source === '/') && (r.destination === '/api/index.js' || r.destination === '/index.html'));
+    assert.strictEqual(brokenRootRewrite, undefined, 'Must not rewrite root / directly to avoid edge rewrite cycle');
   });
 
   await it('regression test: RelationalDatabase.load() never calls fs.mkdirSync on non-existent path regardless of flags', () => {
@@ -664,10 +667,30 @@ async function runAllTests() {
     await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
 
     try {
-      // 1. GET / - SPA fallback should return HTTP 200 with HTML (not 500)
+      // 1. GET / - Root serves index.html
       const rootRes = await makeHttpCall(testServer, 'GET', '/');
       assert.strictEqual(rootRes.statusCode, 200, 'GET / must return HTTP 200');
       assert.ok(rootRes.body.includes('Cartman'), 'GET / must return HTML containing Cartman');
+
+      // 1b. GET /dashboard - SPA deep link serves index.html
+      const dashRes = await makeHttpCall(testServer, 'GET', '/dashboard');
+      assert.strictEqual(dashRes.statusCode, 200, 'GET /dashboard must return HTTP 200');
+      assert.ok(dashRes.body.includes('Cartman'), 'GET /dashboard must return HTML');
+
+      // 1c. GET /orders - SPA deep link serves index.html
+      const ordersViewRes = await makeHttpCall(testServer, 'GET', '/orders');
+      assert.strictEqual(ordersViewRes.statusCode, 200, 'GET /orders must return HTTP 200');
+      assert.ok(ordersViewRes.body.includes('Cartman'), 'GET /orders must return HTML');
+
+      // 1d. GET /css/styles.css - Static CSS asset
+      const cssRes = await makeHttpCall(testServer, 'GET', '/css/styles.css');
+      assert.strictEqual(cssRes.statusCode, 200, 'GET /css/styles.css must return HTTP 200');
+      assert.ok(cssRes.body.includes('--'), 'GET /css/styles.css must return CSS content');
+
+      // 1e. GET /js/app.js - Static JS asset
+      const jsRes = await makeHttpCall(testServer, 'GET', '/js/app.js');
+      assert.strictEqual(jsRes.statusCode, 200, 'GET /js/app.js must return HTTP 200');
+      assert.ok(jsRes.body.includes('CartmanApp') || jsRes.body.includes('function') || jsRes.body.includes('const'), 'GET /js/app.js must return JS content');
 
       // 2. GET /api/status - Public demo status
       const statusRes = await makeHttpCall(testServer, 'GET', '/api/status');

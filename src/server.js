@@ -76,16 +76,33 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// Helper to serve index.html with graceful fallback
+function serveIndex(req, res) {
+  const candidates = [
+    path.resolve(__dirname, '../public/index.html'),
+    path.resolve(process.cwd(), 'public/index.html')
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return res.sendFile(candidate, err => {
+        if (err && !res.headersSent) {
+          res.status(200).send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Cartman Dashboard</title></head><body><h1>Cartman Dashboard</h1><p>Public Demo Mode Active.</p></body></html>');
+        }
+      });
+    }
+  }
+  res.status(200).send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Cartman Dashboard</title></head><body><h1>Cartman Dashboard</h1><p>Public Demo Mode Active.</p></body></html>');
+}
+
+// Root Endpoint - Explicitly serve public/index.html
+app.get('/', serveIndex);
+
 // Single Page Application Fallback
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) {
     return next();
   }
-  const indexPath = path.resolve(__dirname, '../public/index.html');
-  if (fs.existsSync(indexPath)) {
-    return res.sendFile(indexPath);
-  }
-  res.status(200).send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Cartman Dashboard</title></head><body><h1>Cartman Dashboard</h1><p>Public Demo Mode Active.</p></body></html>');
+  serveIndex(req, res);
 });
 
 // Global Error Handler
@@ -125,4 +142,7 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer };
+app.app = app;
+app.startServer = startServer;
+
+module.exports = app;

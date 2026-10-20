@@ -15,7 +15,7 @@
       "destination": "/api/index.js"
     },
     {
-      "source": "/(.*)",
+      "source": "/((?!api(?:/|$)).+)",
       "destination": "/index.html"
     }
   ]
