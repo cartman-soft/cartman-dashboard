@@ -17,6 +17,9 @@ const { BankParser } = require('../src/reconciliation/bankParser');
 const Deduplicator = require('../src/reconciliation/deduplicator');
 const ReconciliationMatcher = require('../src/reconciliation/matcher');
 const AuthService = require('../src/auth/authService');
+const OtpStore = require('../src/auth/otpStore');
+const EmailService = require('../src/auth/emailService');
+const config = require('../src/config');
 const { db, TABLES } = require('../src/db');
 
 let testsPassed = 0;
@@ -177,14 +180,24 @@ async function runAllTests() {
   });
 
   await it('requires 6-digit OTP verification before issuing JWT session', async () => {
-    const res = await AuthService.initiateLogin({ email: 'admin@cartman.com', password: 'CartmanAdmin2026!' });
-    assert.strictEqual(res.otpRequired, true);
-    assert.ok(res.expiresInSeconds > 0);
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    const origHash = config.dashboardPasswordHash;
+    config.dashboardOwnerEmail = 'admin@cartman.com';
+    config.dashboardPasswordHash = AuthService.hashPassword('CartmanAdmin2026!');
+    try {
+      const res = await AuthService.initiateLogin({ email: 'admin@cartman.com', password: 'CartmanAdmin2026!' });
+      assert.strictEqual(res.otpRequired, true);
+      assert.ok(res.expiresInSeconds > 0);
 
-    const tokenRes = await AuthService.verifyOtp({ email: 'admin@cartman.com', otp: res.devOtp || '123456' });
-    assert.ok(tokenRes.token);
-    assert.strictEqual(tokenRes.user.email, 'admin@cartman.com');
-    assert.strictEqual(tokenRes.user.role, 'Admin');
+      const tokenRes = await AuthService.verifyOtp({ email: 'admin@cartman.com', otp: res.devOtp || '123456' });
+      assert.ok(tokenRes.token);
+      assert.strictEqual(tokenRes.user.email, 'admin@cartman.com');
+      assert.strictEqual(tokenRes.user.role, 'Admin');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+      config.dashboardPasswordHash = origHash;
+    }
   });
 
   // Test Group 8: Firebase & Vercel Integration
@@ -359,88 +372,154 @@ async function runAllTests() {
     assert.strictEqual(result.validationError, null);
   });
 
-  // Test Group 10: Public Demo Mode & Vercel Read-Only Security
-  console.log('\n--- 10. Public Demo Mode & Vercel Read-Only Security ---');
+  // Test Group 10: Private Dashboard Authentication & RBAC Protection
+  console.log('\n--- 10. Private Dashboard Authentication & RBAC Protection ---');
 
-  it('blocks all data-changing mutations with 403 and clear demo message', () => {
-    const config = require('../src/config');
+  it('enforces strict authentication on protected endpoints and rejects unauthenticated requests with 401', () => {
     const { requireAuth } = require('../src/auth/middleware');
 
-    // Temporarily simulate demo mode
-    const originalDemoMode = config.isDemoMode;
-    config.isDemoMode = true;
+    let statusSet = null;
+    let responseJson = null;
 
-    try {
-      const mutationMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
-      for (const method of mutationMethods) {
-        let statusSet = null;
-        let responseJson = null;
-
-        const mockReq = { method, headers: {} };
-        const mockRes = {
-          status: (code) => {
-            statusSet = code;
-            return {
-              json: (data) => { responseJson = data; }
-            };
-          }
+    const mockReq = { method: 'GET', headers: {} };
+    const mockRes = {
+      status: (code) => {
+        statusSet = code;
+        return {
+          json: (data) => { responseJson = data; }
         };
-        let nextCalled = false;
-        requireAuth(mockReq, mockRes, () => { nextCalled = true; });
-
-        assert.strictEqual(statusSet, 403, `${method} must return 403 in demo mode`);
-        assert.strictEqual(nextCalled, false, `${method} must NOT reach route handler in demo mode`);
-        assert.strictEqual(responseJson.isDemoLocked, true, 'Response must identify demo lock');
-        assert(responseJson.error.includes('Disabled in Public Demo'), 'Error message must specify Disabled in Public Demo');
       }
-    } finally {
-      config.isDemoMode = originalDemoMode;
-    }
+    };
+    let nextCalled = false;
+    requireAuth(mockReq, mockRes, () => { nextCalled = true; });
+
+    assert.strictEqual(statusSet, 401, 'Unauthenticated request must return 401 Unauthorized');
+    assert.strictEqual(nextCalled, false, 'Unauthenticated request must NOT reach route handler');
+    assert.ok(responseJson.error.includes('Authentication required'), 'Must specify authentication required');
   });
 
-  it('allows read-only GET requests as demo_guest in demo mode without credentials', () => {
+  it('rejects tampered or invalid Bearer tokens with 401', () => {
+    const { requireAuth } = require('../src/auth/middleware');
+
+    let statusSet = null;
+    let responseJson = null;
+
+    const mockReq = { method: 'GET', headers: { authorization: 'Bearer invalid.token.signature' } };
+    const mockRes = {
+      status: (code) => {
+        statusSet = code;
+        return {
+          json: (data) => { responseJson = data; }
+        };
+      }
+    };
+    let nextCalled = false;
+    requireAuth(mockReq, mockRes, () => { nextCalled = true; });
+
+    assert.strictEqual(statusSet, 401, 'Invalid Bearer token must return 401 Unauthorized');
+    assert.strictEqual(nextCalled, false, 'Invalid Bearer token must NOT reach route handler');
+    assert.ok(responseJson.error.includes('Invalid or expired'), 'Must specify invalid or expired token');
+  });
+
+  it('accepts valid Bearer token and attaches authenticated user to req.user', () => {
     const config = require('../src/config');
     const { requireAuth } = require('../src/auth/middleware');
 
-    const originalDemoMode = config.isDemoMode;
-    config.isDemoMode = true;
+    const token = AuthService.issueToken({
+      id: 'admin',
+      username: config.dashboardUsername,
+      email: `${config.dashboardUsername}@cartman.internal`,
+      role: 'Admin',
+      fullName: 'Dashboard Owner'
+    });
+
+    const mockReq = { method: 'GET', headers: { authorization: `Bearer ${token}` } };
+    const mockRes = {};
+    let nextCalled = false;
+
+    requireAuth(mockReq, mockRes, () => { nextCalled = true; });
+
+    assert.strictEqual(nextCalled, true, 'Valid token must pass through to route handler');
+    assert.strictEqual(mockReq.user.id, 'admin');
+    assert.strictEqual(mockReq.user.role, 'Admin');
+    assert.strictEqual(mockReq.user.username, config.dashboardUsername);
+  });
+
+  it('generates secure salted bcrypt password hash via generateCredentials script', () => {
+    const { generateCredentials } = require('../scripts/generateHash');
+    const creds = generateCredentials('CustomAdminPass2026!', 'custom_user');
+
+    assert.strictEqual(creds.username, 'custom_user');
+    assert.ok(creds.passwordHash.startsWith('$2'), 'Hash must be a bcrypt hash string');
+    assert.strictEqual(creds.jwtSecret.length, 64, 'JWT secret must be 32 random bytes in hex (64 chars)');
+    assert.ok(AuthService.verifyPassword('CustomAdminPass2026!', creds.passwordHash), 'Hash must verify with password');
+    assert.ok(!AuthService.verifyPassword('WrongPassword', creds.passwordHash), 'Hash must reject incorrect password');
+  });
+
+  await it('authenticates custom user-configured credentials and rejects unconfigured users', async () => {
+    const config = require('../src/config');
+    const { generateCredentials } = require('../scripts/generateHash');
+
+    const originalUser = config.dashboardUsername;
+    const originalHash = config.dashboardPasswordHash;
 
     try {
-      const mockReq = { method: 'GET', headers: {} };
-      const mockRes = {};
-      let nextCalled = false;
+      const customCreds = generateCredentials('MyVerySecureCustomPass2026!', 'rushit_owner');
+      config.dashboardUsername = customCreds.username;
+      config.dashboardPasswordHash = customCreds.passwordHash;
 
-      requireAuth(mockReq, mockRes, () => { nextCalled = true; });
+      // 1. Login with custom username and custom password succeeds
+      const result = await AuthService.login({
+        username: 'rushit_owner',
+        password: 'MyVerySecureCustomPass2026!'
+      });
+      assert.ok(result.token, 'Must return JWT token');
+      assert.strictEqual(result.user.username, 'rushit_owner');
+      assert.strictEqual(result.user.role, 'Admin');
 
-      assert.strictEqual(nextCalled, true, 'GET request must pass through in demo mode');
-      assert.strictEqual(mockReq.user.id, 'demo_guest', 'User must be assigned demo_guest');
-      assert.strictEqual(mockReq.user.role, 'Admin', 'Guest user must have Admin role for full view navigation');
+      // 2. Login with wrong password throws error
+      let wrongPassErr = null;
+      try {
+        await AuthService.login({
+          username: 'rushit_owner',
+          password: 'WrongPassword123'
+        });
+      } catch (e) {
+        wrongPassErr = e;
+      }
+      assert.ok(wrongPassErr, 'Must reject incorrect password');
+      assert.strictEqual(wrongPassErr.message, 'Invalid username or password.');
+
+      // 3. Login with former or unconfigured username is rejected
+      let unconfErr = null;
+      try {
+        await AuthService.login({
+          username: 'admin',
+          password: 'CartmanAdmin2026!'
+        });
+      } catch (e) {
+        unconfErr = e;
+      }
+      assert.ok(unconfErr, 'Must reject unconfigured username');
+      assert.strictEqual(unconfErr.message, 'Invalid username or password.');
+
     } finally {
-      config.isDemoMode = originalDemoMode;
+      config.dashboardUsername = originalUser;
+      config.dashboardPasswordHash = originalHash;
     }
   });
 
-  it('masks Firebase configuration in demo mode', () => {
+  it('masks Firebase configuration in unconfigured state', () => {
     const config = require('../src/config');
-    const originalDemoMode = config.isDemoMode;
-    config.isDemoMode = true;
-
-    try {
-      // Simulate GET /api/firebase/config handler logic
-      const isConfigured = false;
-      const maskedData = {
-        apiKey: '',
-        projectId: '',
-        isConfigured: false,
-        isDemoMode: true
-      };
-      assert.strictEqual(maskedData.apiKey, '');
-      assert.strictEqual(maskedData.projectId, '');
-      assert.strictEqual(maskedData.isConfigured, false);
-      assert.strictEqual(maskedData.isDemoMode, true);
-    } finally {
-      config.isDemoMode = originalDemoMode;
-    }
+    // Simulate GET /api/firebase/config handler logic
+    const maskedData = {
+      apiKey: '',
+      projectId: '',
+      isConfigured: false
+    };
+    assert.strictEqual(maskedData.apiKey, '');
+    assert.strictEqual(maskedData.projectId, '');
+    assert.strictEqual(maskedData.isConfigured, false);
   });
 
   it('strictly excludes sensitive files in .gitignore and .vercelignore', () => {
@@ -621,18 +700,13 @@ async function runAllTests() {
     }
   });
 
-  await it('serves public read-only GET APIs and blocks all mutations over HTTP in demo mode', async () => {
+  await it('serves private APIs with authentication, blocks unauthenticated requests with 401, and supports login/logout over HTTP', async () => {
     const http = require('http');
     const config = require('../src/config');
     const { app } = require('../src/server');
 
-    const originalDemoMode = config.isDemoMode;
-    const originalReadOnly = config.isReadOnly;
-    config.isDemoMode = true;
-    config.isReadOnly = true;
-
     // Helper for HTTP requests
-    function makeHttpCall(server, method, reqPath, data = null) {
+    function makeHttpCall(server, method, reqPath, data = null, customHeaders = {}) {
       return new Promise((resolve, reject) => {
         const port = server.address().port;
         const options = {
@@ -640,7 +714,7 @@ async function runAllTests() {
           port,
           path: reqPath,
           method,
-          headers: {}
+          headers: { ...customHeaders }
         };
         let bodyPayload = null;
         if (data) {
@@ -662,6 +736,16 @@ async function runAllTests() {
         req.end();
       });
     }
+
+    const { generateCredentials } = require('../scripts/generateHash');
+    const testUsername = 'http_test_admin';
+    const testPassword = 'HttpAdminPass2026!';
+    const testCreds = generateCredentials(testPassword, testUsername);
+
+    const origUser = config.dashboardUsername;
+    const origHash = config.dashboardPasswordHash;
+    config.dashboardUsername = testCreds.username;
+    config.dashboardPasswordHash = testCreds.passwordHash;
 
     const testServer = http.createServer(app);
     await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
@@ -690,70 +774,76 @@ async function runAllTests() {
       // 1e. GET /js/app.js - Static JS asset
       const jsRes = await makeHttpCall(testServer, 'GET', '/js/app.js');
       assert.strictEqual(jsRes.statusCode, 200, 'GET /js/app.js must return HTTP 200');
-      assert.ok(jsRes.body.includes('CartmanApp') || jsRes.body.includes('function') || jsRes.body.includes('const'), 'GET /js/app.js must return JS content');
+      assert.ok(jsRes.body.includes('CartmanApp') || jsRes.body.includes('function'), 'GET /js/app.js must return JS content');
 
-      // 2. GET /api/status - Public demo status
+      // 2. GET /api/status - Health status
       const statusRes = await makeHttpCall(testServer, 'GET', '/api/status');
       assert.strictEqual(statusRes.statusCode, 200);
-      assert.strictEqual(statusRes.json.isDemoMode, true);
-      assert.strictEqual(statusRes.json.isReadOnly, true);
+      assert.strictEqual(statusRes.json.status, 'healthy');
 
-      // 3. GET /api/auth/me - Public guest access without token
-      const meRes = await makeHttpCall(testServer, 'GET', '/api/auth/me');
-      assert.strictEqual(meRes.statusCode, 200);
-      assert.strictEqual(meRes.json.user.id, 'demo_guest');
-      assert.strictEqual(meRes.json.user.role, 'Admin');
+      // 3. GET /api/auth/me without token - MUST return HTTP 401
+      const meUnauth = await makeHttpCall(testServer, 'GET', '/api/auth/me');
+      assert.strictEqual(meUnauth.statusCode, 401, 'GET /api/auth/me without token must be 401 Unauthorized');
 
-      // 4. GET /api/dashboard/overview - Valid demo metrics
-      const overviewRes = await makeHttpCall(testServer, 'GET', '/api/dashboard/overview');
-      assert.strictEqual(overviewRes.statusCode, 200);
-      assert.ok(overviewRes.json.data.grandTotals, 'Must return grand totals');
+      // 4. GET /api/dashboard/overview without token - MUST return HTTP 401
+      const overviewUnauth = await makeHttpCall(testServer, 'GET', '/api/dashboard/overview');
+      assert.strictEqual(overviewUnauth.statusCode, 401, 'GET /api/dashboard/overview without token must be 401 Unauthorized');
 
-      // 5. GET /api/accounts - Masked accounts list
-      const accountsRes = await makeHttpCall(testServer, 'GET', '/api/accounts');
-      assert.strictEqual(accountsRes.statusCode, 200);
-      assert.ok(Array.isArray(accountsRes.json.data));
+      // 5. POST /api/auth/login with WRONG password - MUST return HTTP 401
+      const loginFail = await makeHttpCall(testServer, 'POST', '/api/auth/login', {
+        username: testUsername,
+        password: 'IncorrectPassword123'
+      });
+      assert.strictEqual(loginFail.statusCode, 401, 'Login with incorrect password must return 401');
+      assert.strictEqual(loginFail.json.success, false);
 
-      // 6. GET /api/orders/summary - Order breakdown
-      const ordersRes = await makeHttpCall(testServer, 'GET', '/api/orders/summary');
-      assert.strictEqual(ordersRes.statusCode, 200);
-      assert.ok(ordersRes.json.companyStatusCounts);
+      // 6. POST /api/auth/login with CORRECT configured credentials - MUST return HTTP 200 and JWT
+      const loginSuccess = await makeHttpCall(testServer, 'POST', '/api/auth/login', {
+        username: testUsername,
+        password: testPassword
+      });
+      assert.strictEqual(loginSuccess.statusCode, 200, 'Login with correct credentials must return 200');
+      assert.strictEqual(loginSuccess.json.success, true);
+      assert.ok(loginSuccess.json.token, 'Must return a signed JWT token');
+      assert.strictEqual(loginSuccess.json.user.role, 'Admin');
 
-      // 7. GET /api/reconciliation/summary - Reconciliation overview
-      const reconRes = await makeHttpCall(testServer, 'GET', '/api/reconciliation/summary');
-      assert.strictEqual(reconRes.statusCode, 200);
-      assert.ok(reconRes.json.data.totals);
+      const authToken = loginSuccess.json.token;
+      const authHeaders = { Authorization: `Bearer ${authToken}` };
 
-      // 8. GET /api/firebase/config - Masked empty config
-      const fbRes = await makeHttpCall(testServer, 'GET', '/api/firebase/config');
-      assert.strictEqual(fbRes.statusCode, 200);
-      assert.strictEqual(fbRes.json.data.apiKey, '');
-      assert.strictEqual(fbRes.json.data.projectId, '');
+      // 7. GET /api/auth/me with Bearer token - MUST return HTTP 200 and user profile
+      const meAuth = await makeHttpCall(testServer, 'GET', '/api/auth/me', null, authHeaders);
+      assert.strictEqual(meAuth.statusCode, 200);
+      assert.strictEqual(meAuth.json.success, true);
+      assert.strictEqual(meAuth.json.user.id, 'admin');
 
-      // 9. GET /api/sales-report/accounts - Sales report accounts
-      const srAccRes = await makeHttpCall(testServer, 'GET', '/api/sales-report/accounts');
-      assert.strictEqual(srAccRes.statusCode, 200);
-      assert.ok(Array.isArray(srAccRes.json.accounts));
+      // 8. GET /api/dashboard/overview with Bearer token - MUST return HTTP 200 and metrics
+      const overviewAuth = await makeHttpCall(testServer, 'GET', '/api/dashboard/overview', null, authHeaders);
+      assert.strictEqual(overviewAuth.statusCode, 200);
+      assert.ok(overviewAuth.json.data.grandTotals, 'Must return grand totals');
 
-      // 10. POST mutations MUST ALL return HTTP 403 Forbidden
-      const postLogin = await makeHttpCall(testServer, 'POST', '/api/auth/login', { email: 'admin@cartman.com', password: 'xyz' });
-      assert.strictEqual(postLogin.statusCode, 403, 'POST /api/auth/login must be 403 in demo mode');
+      // 9. GET /api/accounts with Bearer token - MUST return HTTP 200 and accounts
+      const accountsAuth = await makeHttpCall(testServer, 'GET', '/api/accounts', null, authHeaders);
+      assert.strictEqual(accountsAuth.statusCode, 200);
+      assert.ok(Array.isArray(accountsAuth.json.data));
 
-      const postAccounts = await makeHttpCall(testServer, 'POST', '/api/accounts', { marketplace: 'amazon' });
-      assert.strictEqual(postAccounts.statusCode, 403, 'POST /api/accounts must be 403 in demo mode');
+      // 10. GET /api/orders/summary with Bearer token - MUST return HTTP 200
+      const ordersAuth = await makeHttpCall(testServer, 'GET', '/api/orders/summary', null, authHeaders);
+      assert.strictEqual(ordersAuth.statusCode, 200);
+      assert.ok(ordersAuth.json.companyStatusCounts);
 
-      const postReconMatch = await makeHttpCall(testServer, 'POST', '/api/reconciliation/match', { bankTransactionId: '1', settlementId: '2' });
-      assert.strictEqual(postReconMatch.statusCode, 403, 'POST /api/reconciliation/match must be 403 in demo mode');
+      // 11. GET /api/reconciliation/summary with Bearer token - MUST return HTTP 200
+      const reconAuth = await makeHttpCall(testServer, 'GET', '/api/reconciliation/summary', null, authHeaders);
+      assert.strictEqual(reconAuth.statusCode, 200);
+      assert.ok(reconAuth.json.data.totals);
 
-      const postUsers = await makeHttpCall(testServer, 'POST', '/api/users', { email: 'new@cartman.com' });
-      assert.strictEqual(postUsers.statusCode, 403, 'POST /api/users must be 403 in demo mode');
-
-      const postFirebase = await makeHttpCall(testServer, 'POST', '/api/firebase/config', { apiKey: 'key', projectId: 'proj' });
-      assert.strictEqual(postFirebase.statusCode, 403, 'POST /api/firebase/config must be 403 in demo mode');
+      // 12. POST /api/auth/logout - MUST return HTTP 200
+      const logoutRes = await makeHttpCall(testServer, 'POST', '/api/auth/logout', {});
+      assert.strictEqual(logoutRes.statusCode, 200);
+      assert.strictEqual(logoutRes.json.success, true);
 
     } finally {
-      config.isDemoMode = originalDemoMode;
-      config.isReadOnly = originalReadOnly;
+      config.dashboardUsername = origUser;
+      config.dashboardPasswordHash = origHash;
       await new Promise(resolve => testServer.close(resolve));
     }
   });
@@ -768,6 +858,989 @@ async function runAllTests() {
       const raw = fs.readFileSync(dbPath, 'utf8');
       const parsed = JSON.parse(raw);
       assert.ok(parsed, 'Local cartman_db.json must contain valid JSON');
+    }
+  });
+
+  // Test Group 12: Passwordless Email OTP Authentication & Rate Limiting
+  console.log('\n--- 12. Passwordless Email OTP Authentication & Rate Limiting ---');
+
+  await it('rejects unauthorized arbitrary email addresses from requesting an OTP', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+
+    try {
+      let err = null;
+      try {
+        await AuthService.requestEmailOtp({ email: 'unauthorized_stranger@external.com', ip: '10.0.0.1' });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err, 'Must reject arbitrary unauthorized email');
+      assert.ok(err.message.includes('Only the configured dashboard owner email is permitted'), 'Error message must state restriction');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('fails with a clear server configuration error when DASHBOARD_OWNER_EMAIL is missing', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = '';
+    OtpStore.resetForTesting();
+
+    try {
+      let err = null;
+      try {
+        await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.1' });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err, 'Must reject when DASHBOARD_OWNER_EMAIL is not configured');
+      assert.ok(err.message.includes('Server Configuration Error: DASHBOARD_OWNER_EMAIL is not configured on the server'), 'Error message must clearly state configuration requirement');
+      assert.ok(!err.message.includes('owner@cartman.internal'), 'Must never mention or fall back to internal mock email');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('normalizes owner email comparison using trim() and lowercase', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      // Test matching with whitespace and mixed casing
+      const res = await AuthService.requestEmailOtp({ email: '   OWNER@CartmanDashboard.COM   ', ip: '10.0.0.2' });
+      assert.strictEqual(res.success, true);
+      assert.strictEqual(res.email, 'owner@cartmandashboard.com');
+      assert.strictEqual(res.deliveryMode, 'dev_mock');
+      assert.ok(res.message.includes('server terminal console'), 'Must explain dev mode OTP location');
+      assert.strictEqual(res.otp, undefined, 'Must not expose OTP in response');
+      assert.strictEqual(res.devOtp, undefined, 'Must not expose devOtp in response');
+
+      // Test non-owner email is rejected
+      let nonOwnerErr = null;
+      try {
+        await AuthService.requestEmailOtp({ email: 'stranger@external.com', ip: '10.0.0.2' });
+      } catch (e) {
+        nonOwnerErr = e;
+      }
+      assert.ok(nonOwnerErr, 'Must reject non-owner email');
+      assert.ok(nonOwnerErr.message.includes('Access Denied: Only the configured dashboard owner email is permitted to log in.'));
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('loads .env from project root consistently regardless of cwd and ignores .env.example', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const projectRoot = path.resolve(__dirname, '..');
+    const rootEnv = path.resolve(projectRoot, '.env');
+    const exampleEnv = path.resolve(projectRoot, '.env.example');
+
+    assert.ok(fs.existsSync(rootEnv), 'Root .env must exist');
+    assert.ok(fs.existsSync(exampleEnv), '.env.example must exist');
+
+    // Verify .env.example is not loaded as active configuration
+    const exampleContent = fs.readFileSync(exampleEnv, 'utf8');
+    assert.ok(exampleContent.includes('DASHBOARD_OWNER_EMAIL'), '.env.example has template variables');
+
+    // Test loadRootEnv behavior
+    const config = require('../src/config');
+    assert.strictEqual(typeof config.loadRootEnv, 'function');
+  });
+
+  await it('handles email provider delivery failure without reporting success', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+
+    // Temporarily mock EmailService.sendOtp to simulate provider failure
+    const origSendOtp = EmailService.sendOtp;
+    EmailService.sendOtp = async () => {
+      throw new Error('Resend delivery failed: Domain verification pending');
+    };
+
+    try {
+      let deliveryErr = null;
+      try {
+        await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.8' });
+      } catch (e) {
+        deliveryErr = e;
+      }
+      assert.ok(deliveryErr, 'Must throw error when email provider delivery fails');
+      assert.ok(deliveryErr.message.includes('Domain verification pending'), 'Must propagate delivery failure reason');
+    } finally {
+      EmailService.sendOtp = origSendOtp;
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('generates cryptographically secure 6-digit OTP and signed challenge token for owner email without leaking OTP in response', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      const res = await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.2' });
+      assert.strictEqual(res.success, true);
+      assert.ok(res.challengeToken, 'Must issue a signed challenge token');
+      assert.strictEqual(typeof res.challengeToken, 'string');
+      assert.strictEqual(res.otp, undefined, 'Must NEVER reveal OTP in response object');
+      assert.strictEqual(res.devOtp, undefined, 'Must NEVER reveal devOtp in response object');
+      assert.strictEqual(res.expiresInSeconds, 300, 'Must have 5-minute expiry (300 seconds)');
+
+      const dispatchedOtp = EmailService.getLastDevOtp();
+      assert.ok(dispatchedOtp, 'Email service must record dispatched OTP in dev/test mode');
+      assert.strictEqual(dispatchedOtp.length, 6, 'OTP must be exactly 6 digits');
+      assert.ok(/^\d{6}$/.test(dispatchedOtp), 'OTP must be entirely numeric');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('verifies correct OTP, consumes token, and issues signed session JWT for Admin user', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      const otpReq = await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.3' });
+      const otpCode = EmailService.getLastDevOtp();
+
+      const verifyRes = await AuthService.verifyEmailOtp({
+        email: 'owner@cartmandashboard.com',
+        otp: otpCode,
+        challengeToken: otpReq.challengeToken,
+        ip: '10.0.0.3'
+      });
+
+      assert.ok(verifyRes.token, 'Must return signed session JWT');
+      assert.strictEqual(verifyRes.user.email, 'owner@cartmandashboard.com');
+      assert.strictEqual(verifyRes.user.role, 'Admin');
+
+      // Verify token authenticity
+      const decoded = AuthService.verifyToken(verifyRes.token);
+      assert.strictEqual(decoded.email, 'owner@cartmandashboard.com');
+      assert.strictEqual(decoded.role, 'Admin');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('rejects incorrect OTP codes and reports remaining attempts', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      const otpReq = await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.4' });
+      let err = null;
+      try {
+        await AuthService.verifyEmailOtp({
+          email: 'owner@cartmandashboard.com',
+          otp: '000000',
+          challengeToken: otpReq.challengeToken,
+          ip: '10.0.0.4'
+        });
+      } catch (e) {
+        err = e;
+      }
+
+      assert.ok(err, 'Must reject incorrect OTP code');
+      assert.ok(err.message.includes('Invalid verification code'), 'Must notify user of invalid code');
+      assert.ok(err.message.includes('remaining'), 'Must report remaining attempts');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('enforces single-use guarantee and strictly rejects OTP replay attacks', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      const otpReq = await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.5' });
+      const otpCode = EmailService.getLastDevOtp();
+
+      // First verification succeeds
+      const firstRes = await AuthService.verifyEmailOtp({
+        email: 'owner@cartmandashboard.com',
+        otp: otpCode,
+        challengeToken: otpReq.challengeToken,
+        ip: '10.0.0.5'
+      });
+      assert.ok(firstRes.token);
+
+      // Second verification of same challengeToken MUST fail
+      let replayErr = null;
+      try {
+        await AuthService.verifyEmailOtp({
+          email: 'owner@cartmandashboard.com',
+          otp: otpCode,
+          challengeToken: otpReq.challengeToken,
+          ip: '10.0.0.5'
+        });
+      } catch (e) {
+        replayErr = e;
+      }
+
+      assert.ok(replayErr, 'Must reject re-verification of already used OTP');
+      assert.ok(replayErr.message.includes('already been used'), 'Must specify code was already used');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('strictly rejects expired OTP verification tokens', async () => {
+    const jwt = require('jsonwebtoken');
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+
+    try {
+      // Create a challenge token that expired 10 seconds ago
+      const expiredPayload = {
+        email: 'owner@cartmandashboard.com',
+        otpHash: 'dummyhash',
+        salt: 'dummysalt',
+        expiresAt: Date.now() - 10000,
+        jti: 'expired_jti_123'
+      };
+
+      const expiredToken = jwt.sign(expiredPayload, config.jwtSecret, {
+        expiresIn: '-10s'
+      });
+
+      let expireErr = null;
+      try {
+        await AuthService.verifyEmailOtp({
+          email: 'owner@cartmandashboard.com',
+          otp: '123456',
+          challengeToken: expiredToken,
+          ip: '10.0.0.6'
+        });
+      } catch (e) {
+        expireErr = e;
+      }
+
+      assert.ok(expireErr, 'Must reject expired challenge token');
+      assert.ok(expireErr.message.includes('expired'), 'Must state token has expired');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('enforces rate limits on excessive OTP generation requests (3 per 10m window)', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+
+    const testIp = '10.99.88.77';
+    try {
+      // 3 successful requests
+      await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: testIp });
+      await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: testIp });
+      await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: testIp });
+
+      // 4th request must be blocked by rate limit
+      let rateLimitErr = null;
+      try {
+        await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: testIp });
+      } catch (e) {
+        rateLimitErr = e;
+      }
+
+      assert.ok(rateLimitErr, '4th OTP request within window must be rejected');
+      assert.ok(rateLimitErr.message.includes('Too many OTP requests'), 'Error must indicate rate limit');
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+      OtpStore.resetForTesting();
+    }
+  });
+
+  await it('enforces maximum 3 verification attempts per challenge session', async () => {
+    const config = require('../src/config');
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'owner@cartmandashboard.com';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    try {
+      const otpReq = await AuthService.requestEmailOtp({ email: 'owner@cartmandashboard.com', ip: '10.0.0.7' });
+
+      // Attempt 1 (wrong code)
+      await assert.rejects(
+        () => AuthService.verifyEmailOtp({ email: 'owner@cartmandashboard.com', otp: '111111', challengeToken: otpReq.challengeToken, ip: '10.0.0.7' }),
+        /2 attempts remaining/
+      );
+
+      // Attempt 2 (wrong code)
+      await assert.rejects(
+        () => AuthService.verifyEmailOtp({ email: 'owner@cartmandashboard.com', otp: '222222', challengeToken: otpReq.challengeToken, ip: '10.0.0.7' }),
+        /1 attempt remaining/
+      );
+
+      // Attempt 3 (wrong code) - consumes token
+      await assert.rejects(
+        () => AuthService.verifyEmailOtp({ email: 'owner@cartmandashboard.com', otp: '333333', challengeToken: otpReq.challengeToken, ip: '10.0.0.7' }),
+        /Maximum verification attempts exceeded/
+      );
+
+      // Even if user now submits the actual correct code, challenge is dead
+      const correctOtp = EmailService.getLastDevOtp();
+      await assert.rejects(
+        () => AuthService.verifyEmailOtp({ email: 'owner@cartmandashboard.com', otp: correctOtp, challengeToken: otpReq.challengeToken, ip: '10.0.0.7' }),
+        /Maximum verification attempts exceeded|already been used/
+      );
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+    }
+  });
+
+  await it('serves passwordless Email OTP flow over HTTP endpoints and allows authenticated dashboard access', async () => {
+    const http = require('http');
+    const config = require('../src/config');
+    const { app: localApp } = require('../src/server');
+
+    const origOwner = config.dashboardOwnerEmail;
+    config.dashboardOwnerEmail = 'live_owner@cartman.internal';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    function makeCall(server, method, reqPath, data = null, customHeaders = {}) {
+      return new Promise((resolve, reject) => {
+        const port = server.address().port;
+        const bodyStr = data ? JSON.stringify(data) : '';
+        const headers = { ...customHeaders };
+        if (data) {
+          headers['Content-Type'] = 'application/json';
+          headers['Content-Length'] = Buffer.byteLength(bodyStr);
+        }
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: reqPath,
+          method,
+          headers
+        }, (res) => {
+          let chunks = '';
+          res.on('data', chunk => { chunks += chunk; });
+          res.on('end', () => {
+            let json = null;
+            try { json = JSON.parse(chunks); } catch (e) {}
+            resolve({ statusCode: res.statusCode, headers: res.headers, body: chunks, json });
+          });
+        });
+        req.on('error', reject);
+        if (bodyStr) req.write(bodyStr);
+        req.end();
+      });
+    }
+
+    const testServer = http.createServer(localApp);
+    await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      // 0a. POST /api/auth/request-otp with missing DASHBOARD_OWNER_EMAIL returns HTTP 500
+      config.dashboardOwnerEmail = '';
+      const missingConfigReq = await makeCall(testServer, 'POST', '/api/auth/request-otp', {
+        email: 'live_owner@cartman.internal'
+      });
+      assert.strictEqual(missingConfigReq.statusCode, 500);
+      assert.strictEqual(missingConfigReq.json.success, false);
+      assert.ok(missingConfigReq.json.error.includes('Server Configuration Error'));
+      config.dashboardOwnerEmail = 'live_owner@cartman.internal';
+
+      // 0b. POST /api/auth/request-otp when email provider fails returns HTTP 502
+      const origSendMethod = EmailService.sendOtp;
+      EmailService.sendOtp = async () => { throw new Error('Resend delivery failed with HTTP 403'); };
+      const failedDeliveryReq = await makeCall(testServer, 'POST', '/api/auth/request-otp', {
+        email: 'live_owner@cartman.internal'
+      });
+      assert.strictEqual(failedDeliveryReq.statusCode, 502);
+      assert.strictEqual(failedDeliveryReq.json.success, false);
+      assert.ok(failedDeliveryReq.json.error.includes('Resend delivery failed'));
+      EmailService.sendOtp = origSendMethod;
+
+      // 1. POST /api/auth/request-otp with unauthorized email returns HTTP 403
+      const unauthReq = await makeCall(testServer, 'POST', '/api/auth/request-otp', {
+        email: 'random_hacker@evil.com'
+      });
+      assert.strictEqual(unauthReq.statusCode, 403);
+      assert.strictEqual(unauthReq.json.success, false);
+
+      // 2. POST /api/auth/request-otp with verified owner email returns HTTP 200 + challengeToken
+      const ownerReq = await makeCall(testServer, 'POST', '/api/auth/request-otp', {
+        email: 'live_owner@cartman.internal'
+      });
+      assert.strictEqual(ownerReq.statusCode, 200);
+      assert.strictEqual(ownerReq.json.success, true);
+      assert.ok(ownerReq.json.challengeToken);
+      assert.strictEqual(ownerReq.json.otp, undefined, 'Must not leak OTP over HTTP');
+
+      const challengeToken = ownerReq.json.challengeToken;
+      const correctOtp = EmailService.getLastDevOtp();
+
+      // 3. POST /api/auth/verify-otp with WRONG code returns HTTP 400
+      const wrongVerify = await makeCall(testServer, 'POST', '/api/auth/verify-otp', {
+        email: 'live_owner@cartman.internal',
+        otp: '999999',
+        challengeToken
+      });
+      assert.strictEqual(wrongVerify.statusCode, 400);
+      assert.strictEqual(wrongVerify.json.success, false);
+
+      // 4. POST /api/auth/verify-otp with CORRECT code returns HTTP 200 + Session JWT
+      const correctVerify = await makeCall(testServer, 'POST', '/api/auth/verify-otp', {
+        email: 'live_owner@cartman.internal',
+        otp: correctOtp,
+        challengeToken
+      });
+      assert.strictEqual(correctVerify.statusCode, 200);
+      assert.strictEqual(correctVerify.json.success, true);
+      assert.ok(correctVerify.json.token);
+      assert.strictEqual(correctVerify.json.user.role, 'Admin');
+
+      const sessionToken = correctVerify.json.token;
+
+      // 5. GET /api/auth/me with session token returns user profile
+      const meRes = await makeCall(testServer, 'GET', '/api/auth/me', null, {
+        Authorization: `Bearer ${sessionToken}`
+      });
+      assert.strictEqual(meRes.statusCode, 200);
+      assert.strictEqual(meRes.json.user.email, 'live_owner@cartman.internal');
+
+      // 6. Access protected data endpoint /api/dashboard/overview
+      const dashRes = await makeCall(testServer, 'GET', '/api/dashboard/overview', null, {
+        Authorization: `Bearer ${sessionToken}`
+      });
+      assert.strictEqual(dashRes.statusCode, 200);
+      assert.ok(dashRes.json.data.grandTotals);
+
+      // 7. POST /api/auth/logout succeeds
+      const logoutRes = await makeCall(testServer, 'POST', '/api/auth/logout', {});
+      assert.strictEqual(logoutRes.statusCode, 200);
+      assert.strictEqual(logoutRes.json.success, true);
+
+    } finally {
+      config.dashboardOwnerEmail = origOwner;
+      await new Promise(resolve => testServer.close(resolve));
+    }
+  });
+
+  await it('verifies that all private data APIs strictly return 401 Unauthorized without valid JWT and DEMO_MODE=false', async () => {
+    const http = require('http');
+    const { app: localApp } = require('../src/server');
+    const config = require('../src/config');
+
+    const origDemo = config.isDemoMode;
+    config.isDemoMode = false;
+
+    function getUnauth(server, reqPath) {
+      return new Promise((resolve, reject) => {
+        const port = server.address().port;
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: reqPath,
+          method: 'GET'
+        }, (res) => {
+          let chunks = '';
+          res.on('data', c => { chunks += c; });
+          res.on('end', () => {
+            let json = {};
+            try { json = JSON.parse(chunks); } catch (e) {}
+            resolve({ statusCode: res.statusCode, json });
+          });
+        });
+        req.on('error', reject);
+        req.end();
+      });
+    }
+
+    const testServer = http.createServer(localApp);
+    await new Promise(resolve => testServer.listen(0, '127.0.0.1', resolve));
+
+    const protectedEndpoints = [
+      '/api/auth/me',
+      '/api/dashboard/overview',
+      '/api/dashboard/trends',
+      '/api/accounts',
+      '/api/orders/summary',
+      '/api/reconciliation/summary',
+      '/api/bank/profiles',
+      '/api/reports/print',
+      '/api/users',
+      '/api/integrations/specs',
+      '/api/sales-report/daily-summaries'
+    ];
+
+    try {
+      for (const endpoint of protectedEndpoints) {
+        const res = await getUnauth(testServer, endpoint);
+        assert.strictEqual(
+          res.statusCode,
+          401,
+          `Endpoint ${endpoint} must strictly return 401 Unauthorized without valid JWT token`
+        );
+        assert.strictEqual(res.json.success, false);
+      }
+    } finally {
+      config.isDemoMode = origDemo;
+      await new Promise(resolve => testServer.close(resolve));
+    }
+  });
+
+  await it('verifies that Redis persistence synchronizes rate limits, attempt counts, and single-use JTI across serverless instances', async () => {
+    const http = require('http');
+    const config = require('../src/config');
+    const origUrl = config.upstashRedisUrl;
+    const origToken = config.upstashRedisToken;
+    const origOwner = config.dashboardOwnerEmail;
+
+    config.dashboardOwnerEmail = 'redis_owner@cartman.internal';
+    OtpStore.resetForTesting();
+    EmailService.clearDevOtp();
+
+    // Mock an Upstash Redis REST service in memory
+    const redisKV = new Map();
+    const redisServer = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        let cmd = [];
+        try { cmd = JSON.parse(body); } catch (e) {}
+        const op = (cmd[0] || '').toUpperCase();
+        let result = null;
+
+        if (op === 'INCR') {
+          const val = (parseInt(redisKV.get(cmd[1]) || '0', 10) + 1);
+          redisKV.set(cmd[1], val.toString());
+          result = val;
+        } else if (op === 'EXPIRE') {
+          result = 1;
+        } else if (op === 'GET') {
+          result = redisKV.get(cmd[1]) || null;
+        } else if (op === 'SETEX') {
+          redisKV.set(cmd[1], cmd[3]);
+          result = 'OK';
+        } else if (op === 'DEL') {
+          redisKV.delete(cmd[1]);
+          result = 1;
+        }
+
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ result }));
+      });
+    });
+
+    await new Promise(resolve => redisServer.listen(0, '127.0.0.1', resolve));
+    const redisPort = redisServer.address().port;
+
+    // Point config to this Redis mock
+    config.upstashRedisUrl = `http://127.0.0.1:${redisPort}`;
+    config.upstashRedisToken = 'mock_upstash_token';
+
+    try {
+      // 1. Create OTP -> persists in Redis
+      const otpReq = await AuthService.requestEmailOtp({ email: 'redis_owner@cartman.internal', ip: '127.0.0.1' });
+      assert.ok(redisKV.has('otp:redis_owner@cartman.internal'), 'Must persist active OTP record in Redis');
+
+      // 2. Clear local memory maps to simulate cold start on a new serverless instance
+      OtpStore.resetForTesting();
+
+      // 3. Verify OTP on "Instance B" using the Redis mock state
+      const otpCode = EmailService.getLastDevOtp();
+      const verifyRes = await AuthService.verifyEmailOtp({
+        email: 'redis_owner@cartman.internal',
+        otp: otpCode,
+        challengeToken: otpReq.challengeToken,
+        ip: '127.0.0.1'
+      });
+      assert.ok(verifyRes.token, 'Must successfully verify and return JWT');
+
+      // 4. Verify that consumed_jti was written to Redis
+      let jtiFound = false;
+      for (const k of redisKV.keys()) {
+        if (k.startsWith('consumed_jti:')) jtiFound = true;
+      }
+      assert.ok(jtiFound, 'Must record consumed JTI in Redis for distributed replay prevention');
+
+      // 5. Clear local memory maps again to simulate "Instance C"
+      OtpStore.resetForTesting();
+
+      // 6. Attempt replay on "Instance C" -> MUST fail because Redis knows JTI is consumed
+      let replayErr = null;
+      try {
+        await AuthService.verifyEmailOtp({
+          email: 'redis_owner@cartman.internal',
+          otp: otpCode,
+          challengeToken: otpReq.challengeToken,
+          ip: '127.0.0.1'
+        });
+      } catch (e) {
+        replayErr = e;
+      }
+      assert.ok(replayErr, 'Replay on separate serverless instance must fail via Redis');
+      assert.ok(replayErr.message.includes('already been used'), 'Must reject consumed JTI across instances');
+
+    } finally {
+      config.upstashRedisUrl = origUrl;
+      config.upstashRedisToken = origToken;
+      config.dashboardOwnerEmail = origOwner;
+      await new Promise(resolve => redisServer.close(resolve));
+      OtpStore.resetForTesting();
+    }
+  });
+
+  console.log('\n--- 13. Resend Email Delivery Service & Safe Error Handling ---');
+
+  function mockHttpsRequest({ statusCode = 200, body = '{}', error = null, onRequest = null }) {
+    const https = require('https');
+    const EventEmitter = require('events');
+    const origRequest = https.request;
+
+    https.request = function(options, callback) {
+      const reqEmitter = new EventEmitter();
+      let sentChunks = '';
+
+      reqEmitter.write = function(chunk) {
+        if (chunk) sentChunks += chunk;
+        return true;
+      };
+
+      reqEmitter.setTimeout = function() { return this; };
+      reqEmitter.destroy = function(err) {
+        reqEmitter.emit('error', err);
+        return this;
+      };
+
+      reqEmitter.end = function(chunk) {
+        if (chunk) sentChunks += chunk;
+        if (onRequest) {
+          onRequest(options, sentChunks);
+        }
+        process.nextTick(() => {
+          if (error) {
+            reqEmitter.emit('error', error);
+            return;
+          }
+
+          const resEmitter = new EventEmitter();
+          resEmitter.statusCode = statusCode;
+          resEmitter.headers = { 'content-type': 'application/json' };
+
+          if (callback) {
+            callback(resEmitter);
+          }
+
+          process.nextTick(() => {
+            resEmitter.emit('data', Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)));
+            resEmitter.emit('end');
+          });
+        });
+        return this;
+      };
+
+      return reqEmitter;
+    };
+
+    return () => {
+      https.request = origRequest;
+    };
+  }
+
+  await it('validates and parses EMAIL_FROM configurations correctly and rejects malformed senders', () => {
+    // 1. Display Name + address format
+    const parsed1 = EmailService.parseSender('Cartman Dashboard <onboarding@resend.dev>');
+    assert.strictEqual(parsed1.displayName, 'Cartman Dashboard');
+    assert.strictEqual(parsed1.address, 'onboarding@resend.dev');
+    assert.strictEqual(parsed1.formatted, 'Cartman Dashboard <onboarding@resend.dev>');
+
+    // 2. Pure email address format
+    const parsed2 = EmailService.parseSender('owner@verified-domain.com');
+    assert.strictEqual(parsed2.displayName, '');
+    assert.strictEqual(parsed2.address, 'owner@verified-domain.com');
+    assert.strictEqual(parsed2.formatted, 'owner@verified-domain.com');
+
+    // 3. Rejects empty string or missing sender
+    assert.throws(() => EmailService.parseSender(''), /EMAIL_FROM is required/);
+    assert.throws(() => EmailService.parseSender('   '), /EMAIL_FROM is required/);
+    assert.throws(() => EmailService.parseSender(null), /EMAIL_FROM is required/);
+
+    // 4. Rejects malformed sender strings without valid email
+    assert.throws(() => EmailService.parseSender('Just Plain Text'), /Invalid EMAIL_FROM format/);
+    assert.throws(() => EmailService.parseSender('Cartman <invalid_email>'), /Invalid EMAIL_FROM format/);
+    assert.throws(() => EmailService.parseSender('<onboarding@resend.dev>'), /Invalid EMAIL_FROM format/);
+    assert.throws(() => EmailService.parseSender('owner@domain'), /Invalid EMAIL_FROM format/);
+  });
+
+  await it('validates Resend API key format and throws safe errors when missing or invalid in live delivery', () => {
+    // 1. Valid API key starting with 're_'
+    const key = EmailService.validateApiKey('re_test_live_key_12345');
+    assert.strictEqual(key, 're_test_live_key_12345');
+
+    // 2. Trims leading and trailing whitespace
+    const trimmedKey = EmailService.validateApiKey('   re_spaced_key_67890   ');
+    assert.strictEqual(trimmedKey, 're_spaced_key_67890');
+
+    // 3. Throws safe error when missing
+    assert.throws(() => EmailService.validateApiKey(''), /Email service is not configured/);
+    assert.throws(() => EmailService.validateApiKey(null), /Email service is not configured/);
+
+    // 4. Throws safe error when not starting with 're_'
+    assert.throws(() => EmailService.validateApiKey('invalid_prefix_key'), /Invalid RESEND_API_KEY format/);
+    assert.throws(() => EmailService.validateApiKey('1234567890'), /Invalid RESEND_API_KEY format/);
+  });
+
+  await it('successfully delivers OTP email via Resend API (HTTP 200) and captures provider message ID', async () => {
+    let capturedOptions = null;
+    let capturedPayload = null;
+
+    const restoreHttps = mockHttpsRequest({
+      statusCode: 200,
+      body: JSON.stringify({ id: 'msg_resend_mock_success_1001' }),
+      onRequest: (options, payload) => {
+        capturedOptions = options;
+        capturedPayload = payload;
+      }
+    });
+
+    const origApiKey = config.resendApiKey;
+    const origFrom = config.emailFrom;
+    config.resendApiKey = 're_mock_test_key_for_unit_tests';
+    config.emailFrom = 'Cartman Dashboard <onboarding@resend.dev>';
+
+    try {
+      const res = await EmailService.sendOtp({
+        email: 'test_real_owner@domain.com',
+        otp: '849201',
+        forceResend: true
+      });
+
+      assert.strictEqual(res.success, true);
+      assert.strictEqual(res.id, 'msg_resend_mock_success_1001');
+      assert.strictEqual(res.mode, 'resend');
+
+      // Verify request metadata
+      assert.ok(capturedOptions, 'Must call Resend API endpoint');
+      assert.strictEqual(capturedOptions.hostname, 'api.resend.com');
+      assert.strictEqual(capturedOptions.path, '/emails');
+      assert.strictEqual(capturedOptions.method, 'POST');
+      assert.strictEqual(capturedOptions.headers['Authorization'], 'Bearer re_mock_test_key_for_unit_tests');
+      assert.strictEqual(capturedOptions.headers['Content-Type'], 'application/json');
+
+      // Verify payload structure
+      const parsedBody = JSON.parse(capturedPayload);
+      assert.strictEqual(parsedBody.from, 'Cartman Dashboard <onboarding@resend.dev>');
+      assert.deepStrictEqual(parsedBody.to, ['test_real_owner@domain.com']);
+      assert.ok(parsedBody.subject.includes('849201'));
+      assert.ok(parsedBody.html.includes('849201'));
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+      config.emailFrom = origFrom;
+    }
+  });
+
+  await it('safely handles Resend HTTP 401 Unauthorized without leaking API keys or tokens', async () => {
+    const restoreHttps = mockHttpsRequest({
+      statusCode: 401,
+      body: JSON.stringify({ statusCode: 401, message: 'API key is invalid', name: 'authentication_error' })
+    });
+
+    const origApiKey = config.resendApiKey;
+    config.resendApiKey = 're_mock_bad_key';
+
+    try {
+      let deliveryErr = null;
+      try {
+        await EmailService.sendOtp({
+          email: 'test_real_owner@domain.com',
+          otp: '123456',
+          forceResend: true
+        });
+      } catch (e) {
+        deliveryErr = e;
+      }
+
+      assert.ok(deliveryErr, 'Must reject on HTTP 401');
+      assert.ok(deliveryErr.message.includes('Resend API authentication failed'), 'Must provide clear authentication error');
+      assert.ok(!deliveryErr.message.includes('re_mock_bad_key'), 'Must NEVER leak API key in error message');
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+    }
+  });
+
+  await it('safely handles Resend HTTP 403 sandbox restriction when using onboarding@resend.dev', async () => {
+    const restoreHttps = mockHttpsRequest({
+      statusCode: 403,
+      body: JSON.stringify({
+        statusCode: 403,
+        name: 'validation_error',
+        message: 'You can only send testing emails to your own email address (registered_user@example.com). To send emails to other recipients, please verify a domain at resend.com/domains.'
+      })
+    });
+
+    const origApiKey = config.resendApiKey;
+    const origFrom = config.emailFrom;
+    config.resendApiKey = 're_mock_test_key';
+    config.emailFrom = 'Cartman Dashboard <onboarding@resend.dev>';
+
+    try {
+      let deliveryErr = null;
+      try {
+        await EmailService.sendOtp({
+          email: 'unregistered_recipient@external.com',
+          otp: '123456',
+          forceResend: true
+        });
+      } catch (e) {
+        deliveryErr = e;
+      }
+
+      assert.ok(deliveryErr, 'Must reject on HTTP 403 sandbox restriction');
+      assert.ok(deliveryErr.message.includes('Resend sandbox restriction: onboarding@resend.dev can only deliver to the verified Resend account owner email'), 'Must explain onboarding restriction');
+      assert.ok(deliveryErr.message.includes('verify a custom domain in Resend'), 'Must guide user to verify domain');
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+      config.emailFrom = origFrom;
+    }
+  });
+
+  await it('safely handles Resend HTTP 422 Unprocessable Entity for invalid sender formatting', async () => {
+    const restoreHttps = mockHttpsRequest({
+      statusCode: 422,
+      body: JSON.stringify({
+        statusCode: 422,
+        name: 'validation_error',
+        message: 'The domain unverified-domain.com is not verified.'
+      })
+    });
+
+    const origApiKey = config.resendApiKey;
+    config.resendApiKey = 're_mock_test_key';
+
+    try {
+      let deliveryErr = null;
+      try {
+        await EmailService.sendOtp({
+          email: 'recipient@somewhere.com',
+          otp: '123456',
+          forceResend: true
+        });
+      } catch (e) {
+        deliveryErr = e;
+      }
+
+      assert.ok(deliveryErr, 'Must reject on HTTP 422');
+      assert.ok(deliveryErr.message.includes('Resend rejected the email request (HTTP 422)'), 'Must identify 422 error safely');
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+    }
+  });
+
+  await it('safely handles Resend HTTP 429 rate limit errors and HTTP 500 upstream errors', async () => {
+    const origApiKey = config.resendApiKey;
+    config.resendApiKey = 're_mock_test_key';
+
+    // 1. Test HTTP 429
+    let restoreHttps = mockHttpsRequest({
+      statusCode: 429,
+      body: JSON.stringify({ statusCode: 429, message: 'Too many requests' })
+    });
+
+    try {
+      await assert.rejects(
+        () => EmailService.sendOtp({ email: 'recipient@somewhere.com', otp: '123456', forceResend: true }),
+        /Resend rate limit exceeded \(HTTP 429\)/
+      );
+    } finally {
+      restoreHttps();
+    }
+
+    // 2. Test HTTP 500
+    restoreHttps = mockHttpsRequest({
+      statusCode: 500,
+      body: JSON.stringify({ message: 'Internal Server Error' })
+    });
+
+    try {
+      await assert.rejects(
+        () => EmailService.sendOtp({ email: 'recipient@somewhere.com', otp: '123456', forceResend: true }),
+        /Resend service temporarily unavailable \(HTTP 500\)/
+      );
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+    }
+  });
+
+  await it('safely handles provider network connectivity failures without crashing', async () => {
+    const restoreHttps = mockHttpsRequest({
+      error: new Error('connect ECONNREFUSED 104.18.23.45:443')
+    });
+
+    const origApiKey = config.resendApiKey;
+    config.resendApiKey = 're_mock_test_key';
+
+    try {
+      await assert.rejects(
+        () => EmailService.sendOtp({ email: 'recipient@somewhere.com', otp: '123456', forceResend: true }),
+        /Email provider network error: connect ECONNREFUSED/
+      );
+    } finally {
+      restoreHttps();
+      config.resendApiKey = origApiKey;
+    }
+  });
+
+  await it('strictly ensures development mock OTP output is inaccessible in production mode', async () => {
+    const origEnv = config.nodeEnv;
+    const origKey = config.resendApiKey;
+
+    try {
+      // 1. Simulate production mode
+      config.nodeEnv = 'production';
+      config.resendApiKey = '';
+      EmailService.clearDevOtp();
+
+      // In production mode, getLastDevOtp must always return null
+      assert.strictEqual(EmailService.getLastDevOtp(), null, 'getLastDevOtp() must strictly return null in production mode');
+
+      // In production mode, sendOtp must NEVER fall back to dev_mock when API key is missing
+      await assert.rejects(
+        () => EmailService.sendOtp({ email: 'owner@cartmandashboard.com', otp: '123456' }),
+        /Email service is not configured/
+      );
+
+      // Verify that lastDevOtp was not populated even after failed attempt
+      assert.strictEqual(EmailService.getLastDevOtp(), null, 'Dev OTP must remain null');
+    } finally {
+      config.nodeEnv = origEnv;
+      config.resendApiKey = origKey;
+      EmailService.clearDevOtp();
     }
   });
 

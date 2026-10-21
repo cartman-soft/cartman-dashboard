@@ -18,113 +18,67 @@ class CartmanApp {
     this.bindGlobalEvents();
     this.renderDateFilterControls();
 
-    // Firebase connection deferred per Step 1 requirements
-    // if (window.FirebaseInstance) {
-    //   await window.FirebaseInstance.init();
-    // }
-
-    // Check or bootstrap authentication
-    await this.ensureAuthenticated();
-
-    // Route to initial view
-    this.routeView(window.AppState.get('activeView') || 'dashboard');
+    // Check authentication before loading private views
+    const isAuthenticated = await this.ensureAuthenticated();
+    if (isAuthenticated) {
+      this.routeView(window.AppState.get('activeView') || 'dashboard');
+    }
   }
 
   async ensureAuthenticated() {
-    // 1. Check system status to detect public demo mode
-    try {
-      const statusRes = await fetch('/api/status').then(r => r.json()).catch(() => null);
-      if (statusRes && statusRes.isDemoMode) {
-        window.isDemoMode = true;
-        window.AppState.set('isDemoMode', true);
-        window.AppState.setIncludeDemo(true);
-        const guestUser = {
-          id: 'demo_guest',
-          fullName: 'Demo Guest',
-          email: 'guest@cartmandemo.com',
-          role: 'Viewer'
-        };
-        window.AppState.setUser(guestUser);
-        this.updateUserUI(guestUser);
-        this.renderDemoBanner();
-        return;
-      }
-    } catch (e) {
-      console.warn('[App] Status check failed:', e);
-    }
-
     const token = API.getToken();
     if (token) {
       try {
         const res = await API.auth.me();
-        if (res.isDemoMode) {
-          window.isDemoMode = true;
-          window.AppState.set('isDemoMode', true);
-          window.AppState.setIncludeDemo(true);
-          this.renderDemoBanner();
+        if (res && res.user) {
+          window.AppState.setUser(res.user);
+          this.updateUserUI(res.user);
+          return true;
         }
-        window.AppState.setUser(res.user);
-        this.updateUserUI(res.user);
-        return;
       } catch (e) {
-        console.warn('Session expired or invalid, re-authenticating...');
+        console.warn('Session expired or invalid, prompting login...');
       }
     }
 
-    // Auto-login as default Admin for seamless immediate experience in non-demo mode
-    try {
-      const loginRes = await API.auth.login('admin@cartman.com', 'CartmanAdmin2026!');
-      const verifyRes = await API.auth.verifyOtp('admin@cartman.com', loginRes.devOtp || '123456');
-      API.setToken(verifyRes.token);
-      window.AppState.setUser(verifyRes.user);
-      this.updateUserUI(verifyRes.user);
-    } catch (e) {
-      console.error('Auto-login failed, presenting login modal:', e.message);
-      this.showLoginModal();
-    }
-  }
-
-  renderDemoBanner() {
-    if (document.getElementById('demoModeBanner')) return;
-    const banner = document.createElement('div');
-    banner.id = 'demoModeBanner';
-    banner.style.cssText = 'background: linear-gradient(90deg, #1e293b 0%, #0f172a 100%); border-bottom: 2px solid #10b981; color: #f8fafc; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; font-size: 13px; z-index: 50; flex-wrap: wrap; gap: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.15);';
-    banner.innerHTML = `
-      <div style="display: flex; align-items: center; gap: 10px;">
-        <span style="background: rgba(16, 185, 129, 0.2); border: 1px solid #10b981; color: #34d399; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 4px; letter-spacing: 0.5px;">PUBLIC DEMO</span>
-        <span>Viewing read-only demo with sample marketplace data. File uploads, imports, account edits, and background sync are locked.</span>
-      </div>
-      <span style="color: #94a3b8; font-size: 12px; font-weight: 500;">🔒 Read-Only Guest Mode</span>
-    `;
-
-    const topHeader = document.querySelector('.top-header');
-    if (topHeader && topHeader.parentNode) {
-      topHeader.parentNode.insertBefore(banner, topHeader.nextSibling);
-    }
+    // Unauthenticated: clear token and prompt login
+    API.setToken(null);
+    window.AppState.setUser(null);
+    this.updateUserUI(null);
+    this.showLoginModal();
+    return false;
   }
 
   updateUserUI(user) {
-    if (!user) return;
     const nameEl = document.getElementById('userName');
     const roleEl = document.getElementById('userRole');
     const avatarEl = document.getElementById('userAvatar');
+    const btnLogout = document.getElementById('btnLogout');
 
-    if (nameEl) nameEl.textContent = user.fullName || user.email;
+    if (!user) {
+      if (nameEl) nameEl.textContent = 'Not Signed In';
+      if (roleEl) {
+        roleEl.textContent = 'Locked';
+        roleEl.className = 'role-pill';
+      }
+      if (avatarEl) avatarEl.textContent = '🔒';
+      if (btnLogout) {
+        btnLogout.textContent = 'Sign In';
+        btnLogout.title = 'Sign into your account';
+      }
+      return;
+    }
+
+    if (nameEl) nameEl.textContent = user.fullName || user.username || user.email;
     if (roleEl) {
-      roleEl.textContent = user.role;
-      roleEl.className = `role-pill ${user.role.toLowerCase()}`;
+      roleEl.textContent = user.role || 'Admin';
+      roleEl.className = `role-pill ${(user.role || 'admin').toLowerCase()}`;
     }
     if (avatarEl) {
-      avatarEl.textContent = (user.fullName || user.email).charAt(0).toUpperCase();
+      avatarEl.textContent = (user.fullName || user.username || user.email).charAt(0).toUpperCase();
     }
-
-    if (window.isDemoMode) {
-      const btnLogout = document.getElementById('btnLogout');
-      if (btnLogout) {
-        btnLogout.textContent = 'Guest Mode';
-        btnLogout.title = 'Public Demo Guest Mode (No sign in needed)';
-        btnLogout.style.opacity = '0.75';
-      }
+    if (btnLogout) {
+      btnLogout.textContent = 'Log Out';
+      btnLogout.title = 'Sign out of dashboard';
     }
   }
 
@@ -205,13 +159,17 @@ class CartmanApp {
     // Logout Button
     const btnLogout = document.getElementById('btnLogout');
     if (btnLogout) {
-      btnLogout.onclick = () => {
-        if (window.isDemoMode) {
-          API.toast('Public demo is active with sample data. No sign-in or credentials needed.', 'info');
-          return;
+      btnLogout.onclick = async () => {
+        try {
+          await API.auth.logout();
+        } catch (e) {
+          // ignore logout network errors
         }
         API.setToken(null);
         window.AppState.setUser(null);
+        this.updateUserUI(null);
+        API.toast('You have been signed out.', 'info');
+        this.routeView(window.AppState.get('activeView') || 'dashboard');
         this.showLoginModal();
       };
     }
@@ -275,6 +233,30 @@ class CartmanApp {
   }
 
   routeView(viewName) {
+    if (!window.AppState.get('user')) {
+      if (this.pageTitle) {
+        this.pageTitle.textContent = 'Sign In Required';
+      }
+      this.container.innerHTML = `
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 420px; text-align: center; padding: 40px 20px;">
+          <div style="font-size: 52px; margin-bottom: 16px;">🔐</div>
+          <h2 style="font-size: 22px; font-weight: 700; margin-bottom: 8px; color: var(--text-main);">Authentication Required</h2>
+          <p style="color: var(--text-dim); max-width: 440px; margin-bottom: 24px; line-height: 1.5; font-size: 14px;">
+            This dashboard and its financial reports are protected. Please sign in with your verified owner email to continue.
+          </p>
+          <button class="btn-primary" id="btnPromptLogin" style="padding: 10px 24px; font-size: 14px; font-weight: 600;">
+            ✉️ Sign In with Email OTP
+          </button>
+        </div>
+      `;
+      const btnPrompt = this.container.querySelector('#btnPromptLogin');
+      if (btnPrompt) {
+        btnPrompt.onclick = () => this.showLoginModal();
+      }
+      this.showLoginModal();
+      return;
+    }
+
     const titles = {
       dashboard: 'Company Overview Dashboard',
       'sales-upload': 'Sales Report Upload & Verification',
@@ -347,75 +329,115 @@ class CartmanApp {
   }
 
   showLoginModal() {
-    if (window.isDemoMode) {
-      API.toast('Public demo is active with sample data. No login required.', 'info');
-      return;
-    }
     const modal = document.getElementById('appModal');
     const card = document.getElementById('modalCard');
 
+    if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+    if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+
     card.innerHTML = `
       <div class="modal-header">
-        <div class="modal-title">🔐 Cartman Secure Authentication</div>
+        <div class="modal-title">🔐 Cartman Dashboard Access</div>
         <button class="btn-close-modal" id="btnCloseLoginModal" style="display: none;">✕</button>
       </div>
       <div class="modal-body">
         <!-- Auth Method Selector Tabs -->
         <div style="display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
-          <button type="button" class="btn-secondary active" id="tabCartmanAuth" style="flex: 1; justify-content: center; font-size: 12.5px;">
-            🛡️ 2FA OTP Login
+          <button type="button" class="btn-secondary active" id="tabEmailOtpAuth" style="flex: 1; justify-content: center; font-size: 13px; font-weight: 600;">
+            ✉️ Email OTP Login
           </button>
-          <button type="button" class="btn-secondary" id="tabFirebaseAuth" style="flex: 1; justify-content: center; font-size: 12.5px;">
-            🔥 Firebase Auth & OTP
+          <button type="button" class="btn-secondary" id="tabFirebaseAuth" style="flex: 1; justify-content: center; font-size: 13px;">
+            🔥 Firebase Auth
           </button>
         </div>
 
-        <!-- 1. Standard 2FA Form -->
-        <div id="sectionCartmanAuth">
-          <form id="loginForm">
-            <div id="loginStep1">
+        <!-- 1. Passwordless Email OTP Login -->
+        <div id="sectionEmailOtpAuth">
+          <!-- Step 1: Request OTP -->
+          <div id="otpStep1">
+            <div style="margin-bottom: 16px; font-size: 13px; color: var(--text-muted); line-height: 1.5;">
+              Enter your authorized owner email address to receive a secure 6-digit one-time login code.
+            </div>
+            <form id="otpRequestForm" onsubmit="return false;">
               <div class="form-group">
-                <label class="form-label">Email Address *</label>
-                <input type="email" class="form-control" id="loginEmail" value="admin@cartman.com" required>
+                <label class="form-label" for="otpEmailInput">Owner Email Address *</label>
+                <input type="email" class="form-control" id="otpEmailInput" placeholder="e.g. owner@cartman.com" autocomplete="email" required style="font-size: 14px; padding: 10px 12px;">
               </div>
-              <div class="form-group">
-                <label class="form-label">Password *</label>
-                <input type="password" class="form-control" id="loginPassword" value="CartmanAdmin2026!" required>
-              </div>
-              <div style="font-size: 11.5px; color: var(--text-dim); margin-top: 4px;">
-                Default Accounts:<br>
-                • Admin: <code>admin@cartman.com</code> / <code>CartmanAdmin2026!</code><br>
-                • Accounts: <code>accounts@cartman.com</code> / <code>CartmanAcc2026!</code><br>
-                • Staff: <code>staff@cartman.com</code> / <code>CartmanStaff2026!</code>
-              </div>
-              <div style="margin-top: 16px;">
-                <button type="button" class="btn-primary" id="btnRequestOtp" style="width: 100%; justify-content: center;">
-                  Verify Password & Dispatch OTP
+              <div style="margin-top: 18px;">
+                <button type="submit" class="btn-primary" id="btnSendOtp" style="width: 100%; justify-content: center; padding: 11px; font-size: 14px; font-weight: 600;">
+                  ✉️ Send Verification Code
                 </button>
               </div>
+            </form>
+          </div>
+
+          <!-- Step 2: Verify OTP -->
+          <div id="otpStep2" style="display: none;">
+            <div id="devMockBanner" style="display: none; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; font-size: 13px; color: #92400e; line-height: 1.5;">
+              💻 <strong>Local Development Mode:</strong><br>
+              Real email delivery is not configured (RESEND_API_KEY is unset).<br>
+              Your 6-digit verification code has been printed to your <strong>server terminal console</strong>.
             </div>
 
-            <div id="loginStep2" style="display: none;">
-              <div class="callout-box" style="margin-bottom: 16px;">
-                <span>📲</span>
-                <div>
-                  <strong>OTP Sent!</strong> A 6-digit verification code has been dispatched. For convenience, use dev test code <code id="displayDevOtp">123456</code>.
+            <div style="background: var(--bg-hover, #f8fafc); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; display: flex; align-items: center; justify-content: space-between;">
+              <div style="font-size: 13px; color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 80%;">
+                <span>Code sent to: </span>
+                <strong id="otpTargetEmailText" style="color: var(--primary, #2563eb);"></strong>
+              </div>
+              <button type="button" id="btnChangeEmail" style="background: none; border: none; color: var(--primary, #2563eb); font-size: 12px; cursor: pointer; text-decoration: underline; padding: 0;">
+                Change
+              </button>
+            </div>
+
+            <form id="otpVerifyForm" onsubmit="return false;">
+              <div class="form-group">
+                <label class="form-label" for="otpCodeInput">6-Digit Verification Code *</label>
+                <input type="text" class="form-control" id="otpCodeInput" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code" required style="font-size: 24px; letter-spacing: 8px; text-align: center; font-weight: 700; padding: 10px;">
+              </div>
+
+              <!-- Expiry & Resend Bar -->
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; font-size: 12px;">
+                <div id="otpCountdownTimer" style="color: var(--text-muted); font-weight: 500;">
+                  ⏱️ Expires in: <span id="otpCountdownValue" style="font-weight: 700; color: #d97706;">05:00</span>
                 </div>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Enter 6-Digit OTP Code *</label>
-                <input type="text" class="form-control" id="loginOtpInput" placeholder="Enter 6-digit OTP" maxlength="6" style="font-size: 20px; letter-spacing: 4px; text-align: center;" required>
-              </div>
-              <div style="margin-top: 16px;">
-                <button type="button" class="btn-primary" id="btnVerifyOtp" style="width: 100%; justify-content: center; background: #10b981;">
-                  Verify OTP & Enter Dashboard
+                <button type="button" id="btnResendOtp" style="background: none; border: none; color: var(--primary, #2563eb); font-size: 12px; cursor: pointer; font-weight: 600; padding: 2px 4px;" disabled>
+                  Resend Code (30s)
                 </button>
               </div>
+
+              <div style="margin-top: 18px;">
+                <button type="submit" class="btn-primary" id="btnSubmitOtp" style="width: 100%; justify-content: center; padding: 11px; font-size: 14px; font-weight: 600; background: #10b981;">
+                  🔓 Verify & Enter Dashboard
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Fallback: Local Username & Password -->
+          <div style="margin-top: 22px; border-top: 1px dashed var(--border-color); padding-top: 14px; text-align: center;">
+            <button type="button" id="togglePasswordLogin" style="background: none; border: none; color: var(--text-muted); font-size: 12px; cursor: pointer; text-decoration: underline;">
+              🔑 Sign in with Username & Password (Local Backup)
+            </button>
+
+            <div id="sectionPasswordLogin" style="display: none; margin-top: 14px; text-align: left; padding: 14px; background: var(--bg-hover, #f8fafc); border-radius: 8px; border: 1px solid var(--border-color);">
+              <form id="legacyLoginForm" onsubmit="return false;">
+                <div class="form-group">
+                  <label class="form-label" for="loginUsername">Username *</label>
+                  <input type="text" class="form-control" id="loginUsername" placeholder="Configured username" autocomplete="username">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                  <label class="form-label" for="loginPassword">Password *</label>
+                  <input type="password" class="form-control" id="loginPassword" placeholder="Configured password" autocomplete="current-password">
+                </div>
+                <button type="submit" class="btn-primary" id="btnLoginSubmit" style="width: 100%; justify-content: center; margin-top: 14px; font-size: 13px; font-weight: 600;">
+                  Sign In with Password
+                </button>
+              </form>
             </div>
-          </form>
+          </div>
         </div>
 
-        <!-- 2. Firebase Authentication (Email/Password or Phone OTP) -->
+        <!-- 2. Firebase Authentication -->
         <div id="sectionFirebaseAuth" style="display: none;">
           <div style="margin-bottom: 14px; font-size: 12px; color: var(--text-muted);">
             Sign in directly using Firebase Cloud Authentication.
@@ -433,7 +455,7 @@ class CartmanApp {
           <div id="fbEmailSection">
             <div class="form-group">
               <label class="form-label">Firebase User Email</label>
-              <input type="email" class="form-control" id="fbLoginEmail" placeholder="admin@cartman.com">
+              <input type="email" class="form-control" id="fbLoginEmail" placeholder="user@company.com">
             </div>
             <div class="form-group">
               <label class="form-label">Firebase Password</label>
@@ -471,27 +493,38 @@ class CartmanApp {
 
     modal.classList.add('active');
 
+    // Close button (only shown if already authenticated)
+    const btnClose = card.querySelector('#btnCloseLoginModal');
+    if (window.AppState && window.AppState.get('user')) {
+      btnClose.style.display = 'block';
+      btnClose.onclick = () => {
+        if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+        if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+        modal.classList.remove('active');
+      };
+    }
+
     // Tab switching
-    const tabCartman = card.querySelector('#tabCartmanAuth');
+    const tabEmailOtp = card.querySelector('#tabEmailOtpAuth');
     const tabFirebase = card.querySelector('#tabFirebaseAuth');
-    const secCartman = card.querySelector('#sectionCartmanAuth');
+    const secEmailOtp = card.querySelector('#sectionEmailOtpAuth');
     const secFirebase = card.querySelector('#sectionFirebaseAuth');
 
-    tabCartman.onclick = () => {
-      tabCartman.classList.add('active');
+    tabEmailOtp.onclick = () => {
+      tabEmailOtp.classList.add('active');
       tabFirebase.classList.remove('active');
-      secCartman.style.display = 'block';
+      secEmailOtp.style.display = 'block';
       secFirebase.style.display = 'none';
     };
 
     tabFirebase.onclick = () => {
       tabFirebase.classList.add('active');
-      tabCartman.classList.remove('active');
+      tabEmailOtp.classList.remove('active');
       secFirebase.style.display = 'block';
-      secCartman.style.display = 'none';
+      secEmailOtp.style.display = 'none';
     };
 
-    // Firebase Auth Mode change
+    // Firebase Auth Mode switch
     const fbMode = card.querySelector('#fbAuthMode');
     const fbEmailSec = card.querySelector('#fbEmailSection');
     const fbPhoneSec = card.querySelector('#fbPhoneSection');
@@ -506,7 +539,249 @@ class CartmanApp {
       }
     };
 
-    // Firebase Email Login Button
+    // ==========================================
+    // Email OTP Authentication Handlers
+    // ==========================================
+    const step1 = card.querySelector('#otpStep1');
+    const step2 = card.querySelector('#otpStep2');
+    const emailInput = card.querySelector('#otpEmailInput');
+    const codeInput = card.querySelector('#otpCodeInput');
+    const btnSendOtp = card.querySelector('#btnSendOtp');
+    const btnSubmitOtp = card.querySelector('#btnSubmitOtp');
+    const btnResendOtp = card.querySelector('#btnResendOtp');
+    const btnChangeEmail = card.querySelector('#btnChangeEmail');
+    const countdownValue = card.querySelector('#otpCountdownValue');
+    const targetEmailText = card.querySelector('#otpTargetEmailText');
+
+    let currentEmail = '';
+    let currentChallengeToken = '';
+    let remainingSeconds = 300;
+    let resendCooldown = 30;
+
+    const updateTimerDisplay = (isExpired = false) => {
+      if (!countdownValue) return;
+      if (isExpired) {
+        countdownValue.innerHTML = '<span style="color: #ef4444; font-weight: 700;">Expired!</span>';
+        btnSubmitOtp.disabled = true;
+        btnSubmitOtp.style.opacity = '0.6';
+      } else {
+        const mins = Math.floor(remainingSeconds / 60);
+        const secs = remainingSeconds % 60;
+        countdownValue.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        btnSubmitOtp.disabled = false;
+        btnSubmitOtp.style.opacity = '1';
+      }
+    };
+
+    const startCountdown = (duration = 300) => {
+      if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+      remainingSeconds = duration;
+      updateTimerDisplay(false);
+      this._otpCountdownTimer = setInterval(() => {
+        remainingSeconds--;
+        if (remainingSeconds <= 0) {
+          clearInterval(this._otpCountdownTimer);
+          remainingSeconds = 0;
+          updateTimerDisplay(true);
+        } else {
+          updateTimerDisplay(false);
+        }
+      }, 1000);
+    };
+
+    const startResendCooldown = (duration = 30) => {
+      if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+      resendCooldown = duration;
+      btnResendOtp.disabled = true;
+      btnResendOtp.textContent = `Resend Code (${resendCooldown}s)`;
+      this._otpResendTimer = setInterval(() => {
+        resendCooldown--;
+        if (resendCooldown <= 0) {
+          clearInterval(this._otpResendTimer);
+          btnResendOtp.disabled = false;
+          btnResendOtp.textContent = '🔄 Resend Code';
+        } else {
+          btnResendOtp.textContent = `Resend Code (${resendCooldown}s)`;
+        }
+      }, 1000);
+    };
+
+    // Auto-focus email on open
+    setTimeout(() => {
+      if (emailInput) emailInput.focus();
+    }, 150);
+
+    const handleSendOtp = async (e) => {
+      if (e) e.preventDefault();
+      const email = (emailInput.value || '').trim();
+      if (!email || !email.includes('@')) {
+        API.toast('Please enter a valid owner email address.', 'error');
+        return;
+      }
+
+      btnSendOtp.disabled = true;
+      btnSendOtp.textContent = '⏳ Sending Code...';
+
+      try {
+        const res = await API.auth.requestOtp(email);
+        currentEmail = email;
+        currentChallengeToken = res.challengeToken || '';
+        targetEmailText.textContent = email;
+
+        const devBanner = card.querySelector('#devMockBanner');
+        if (devBanner) {
+          devBanner.style.display = res.deliveryMode === 'dev_mock' ? 'block' : 'none';
+        }
+
+        step1.style.display = 'none';
+        step2.style.display = 'block';
+        codeInput.value = '';
+
+        startCountdown(res.expiresInSeconds || 300);
+        startResendCooldown(30);
+
+        setTimeout(() => codeInput.focus(), 150);
+        API.toast(res.message || 'Verification code sent to your email!', 'info');
+      } catch (err) {
+        API.toast(err.message || 'Failed to send verification code.', 'error');
+      } finally {
+        btnSendOtp.disabled = false;
+        btnSendOtp.textContent = '✉️ Send Verification Code';
+      }
+    };
+
+    card.querySelector('#otpRequestForm').onsubmit = handleSendOtp;
+    btnSendOtp.onclick = handleSendOtp;
+
+    btnResendOtp.onclick = async () => {
+      if (!currentEmail || resendCooldown > 0) return;
+      btnResendOtp.disabled = true;
+      btnResendOtp.textContent = '⏳ Resending...';
+      try {
+        const res = await API.auth.requestOtp(currentEmail);
+        currentChallengeToken = res.challengeToken || '';
+        const devBanner = card.querySelector('#devMockBanner');
+        if (devBanner) {
+          devBanner.style.display = res.deliveryMode === 'dev_mock' ? 'block' : 'none';
+        }
+        startCountdown(res.expiresInSeconds || 300);
+        startResendCooldown(30);
+        codeInput.value = '';
+        codeInput.focus();
+        API.toast('New verification code sent to your email!', 'info');
+      } catch (err) {
+        API.toast(err.message || 'Failed to resend code.', 'error');
+        btnResendOtp.disabled = false;
+        btnResendOtp.textContent = '🔄 Resend Code';
+      }
+    };
+
+    btnChangeEmail.onclick = (e) => {
+      e.preventDefault();
+      if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+      if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+      const devBanner = card.querySelector('#devMockBanner');
+      if (devBanner) devBanner.style.display = 'none';
+      step2.style.display = 'none';
+      step1.style.display = 'block';
+      emailInput.focus();
+    };
+
+    const handleVerifyOtp = async (e) => {
+      if (e) e.preventDefault();
+      const code = (codeInput.value || '').trim();
+      if (!code || !/^\d{6}$/.test(code)) {
+        API.toast('Please enter the complete 6-digit verification code.', 'error');
+        codeInput.focus();
+        return;
+      }
+
+      btnSubmitOtp.disabled = true;
+      btnSubmitOtp.textContent = '⏳ Verifying...';
+
+      try {
+        const res = await API.auth.verifyOtp(currentEmail, code, currentChallengeToken);
+        if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+        if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+
+        API.setToken(res.token);
+        window.AppState.setUser(res.user);
+        this.updateUserUI(res.user);
+        API.toast(`Welcome back, ${res.user.fullName || res.user.email || 'Admin'}!`, 'success');
+        modal.classList.remove('active');
+        this.routeView(window.AppState.get('activeView') || 'dashboard');
+      } catch (err) {
+        API.toast(err.message || 'Invalid or expired verification code.', 'error');
+        btnSubmitOtp.disabled = false;
+        btnSubmitOtp.textContent = '🔓 Verify & Enter Dashboard';
+        codeInput.select();
+      }
+    };
+
+    card.querySelector('#otpVerifyForm').onsubmit = handleVerifyOtp;
+    btnSubmitOtp.onclick = handleVerifyOtp;
+
+    // ==========================================
+    // Legacy Password Login Fallback (Local Backup)
+    // ==========================================
+    const togglePassBtn = card.querySelector('#togglePasswordLogin');
+    const secPassword = card.querySelector('#sectionPasswordLogin');
+    const legacyForm = card.querySelector('#legacyLoginForm');
+    const btnLegacySubmit = card.querySelector('#btnLoginSubmit');
+    const legacyUserInput = card.querySelector('#loginUsername');
+    const legacyPassInput = card.querySelector('#loginPassword');
+
+    togglePassBtn.onclick = (e) => {
+      e.preventDefault();
+      const isHidden = secPassword.style.display === 'none';
+      secPassword.style.display = isHidden ? 'block' : 'none';
+      togglePassBtn.textContent = isHidden
+        ? '▲ Hide Username & Password Login'
+        : '🔑 Sign in with Username & Password (Local Backup)';
+      if (isHidden && legacyUserInput) {
+        legacyUserInput.focus();
+      }
+    };
+
+    const handleLegacyLogin = async (e) => {
+      if (e) e.preventDefault();
+      const username = legacyUserInput.value.trim();
+      const password = legacyPassInput.value;
+
+      if (!username || !password) {
+        API.toast('Please enter your username and password.', 'error');
+        return;
+      }
+
+      btnLegacySubmit.textContent = '⏳ Verifying...';
+      btnLegacySubmit.disabled = true;
+
+      try {
+        const res = await API.auth.login(username, password);
+        if (this._otpCountdownTimer) clearInterval(this._otpCountdownTimer);
+        if (this._otpResendTimer) clearInterval(this._otpResendTimer);
+
+        API.setToken(res.token);
+        window.AppState.setUser(res.user);
+        this.updateUserUI(res.user);
+        API.toast(`Welcome back, ${res.user.fullName || res.user.username}!`, 'success');
+        modal.classList.remove('active');
+        this.routeView(window.AppState.get('activeView') || 'dashboard');
+      } catch (err) {
+        API.toast(err.message || 'Login failed.', 'error');
+        btnLegacySubmit.textContent = 'Sign In with Password';
+        btnLegacySubmit.disabled = false;
+        legacyPassInput.value = '';
+        legacyPassInput.focus();
+      }
+    };
+
+    legacyForm.onsubmit = handleLegacyLogin;
+    btnLegacySubmit.onclick = handleLegacyLogin;
+
+    // ==========================================
+    // Firebase Auth Handlers
+    // ==========================================
     const btnFbEmail = card.querySelector('#btnFirebaseEmailLogin');
     btnFbEmail.onclick = async () => {
       const email = card.querySelector('#fbLoginEmail').value.trim();
@@ -530,7 +805,6 @@ class CartmanApp {
       }
     };
 
-    // Firebase Phone OTP flow
     const btnSendPhone = card.querySelector('#btnSendPhoneOtp');
     const btnVerifyPhone = card.querySelector('#btnVerifyPhoneOtp');
     const phoneVerifySec = card.querySelector('#fbPhoneOtpVerifySection');
@@ -571,62 +845,6 @@ class CartmanApp {
       } catch (err) {
         API.toast(err.message, 'error');
         btnVerifyPhone.textContent = 'Verify SMS Code & Enter';
-      }
-    };
-
-    // Standard 2FA OTP flow
-    let pendingEmail = '';
-    const step1 = card.querySelector('#loginStep1');
-    const step2 = card.querySelector('#loginStep2');
-    const btnRequest = card.querySelector('#btnRequestOtp');
-    const btnVerify = card.querySelector('#btnVerifyOtp');
-    const emailInp = card.querySelector('#loginEmail');
-    const passInp = card.querySelector('#loginPassword');
-    const otpInp = card.querySelector('#loginOtpInput');
-    const displayOtp = card.querySelector('#displayDevOtp');
-
-    btnRequest.onclick = async () => {
-      const email = emailInp.value;
-      const pass = passInp.value;
-      if (!email || !pass) {
-        API.toast('Please enter email and password.', 'error');
-        return;
-      }
-      btnRequest.textContent = '⏳ Verifying...';
-      try {
-        const res = await API.auth.login(email, pass);
-        pendingEmail = res.email;
-        if (res.devOtp) {
-          displayOtp.textContent = res.devOtp;
-          otpInp.value = res.devOtp;
-        }
-        step1.style.display = 'none';
-        step2.style.display = 'block';
-        API.toast('Password verified. Enter 6-digit OTP.', 'info');
-      } catch (err) {
-        API.toast(err.message, 'error');
-        btnRequest.textContent = 'Verify Password & Dispatch OTP';
-      }
-    };
-
-    btnVerify.onclick = async () => {
-      const otp = otpInp.value;
-      if (!otp) {
-        API.toast('Please enter 6-digit OTP.', 'error');
-        return;
-      }
-      btnVerify.textContent = '⏳ Authenticating...';
-      try {
-        const res = await API.auth.verifyOtp(pendingEmail, otp);
-        API.setToken(res.token);
-        window.AppState.setUser(res.user);
-        this.updateUserUI(res.user);
-        API.toast(`Welcome back, ${res.user.fullName}!`, 'success');
-        modal.classList.remove('active');
-        this.routeView(window.AppState.get('activeView') || 'dashboard');
-      } catch (err) {
-        API.toast(err.message, 'error');
-        btnVerify.textContent = 'Verify OTP & Enter Dashboard';
       }
     };
   }

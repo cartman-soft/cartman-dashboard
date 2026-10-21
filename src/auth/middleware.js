@@ -8,35 +8,11 @@ const { db, TABLES } = require('../db');
 const config = require('../config');
 
 function requireAuth(req, res, next) {
-  // Demo Mode Guard: Allow read-only GET requests without token; block data mutations
-  if (config.isDemoMode) {
-    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
-      return res.status(403).json({
-        success: false,
-        isDemoBlocked: true,
-        isDemoLocked: true,
-        error: 'Disabled in Public Demo: File uploads, imports, account edits, and data-changing actions are locked in demo mode.'
-      });
-    }
-
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      req.user = {
-        id: 'demo_guest',
-        email: 'guest@cartman.com',
-        role: 'Admin',
-        fullName: 'Demo Guest',
-        isDemoGuest: true
-      };
-      return next();
-    }
-  }
-
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({
       success: false,
-      error: 'Authentication required. Missing Bearer token.'
+      error: 'Authentication required. Missing or invalid Bearer token.'
     });
   }
 
@@ -50,7 +26,19 @@ function requireAuth(req, res, next) {
     });
   }
 
-  // Refresh user check from DB
+  // 1. Check for configured primary admin
+  if (decoded.id === 'admin') {
+    req.user = {
+      id: 'admin',
+      username: decoded.username || config.dashboardUsername,
+      email: decoded.email || config.dashboardUsername,
+      role: 'Admin',
+      fullName: decoded.fullName || config.dashboardFullName
+    };
+    return next();
+  }
+
+  // 2. Check for database user
   const user = db.findById(TABLES.USERS, decoded.id);
   if (!user || user.status !== 'active') {
     return res.status(401).json({
@@ -61,6 +49,7 @@ function requireAuth(req, res, next) {
 
   req.user = {
     id: user.id,
+    username: user.email,
     email: user.email,
     role: user.role,
     fullName: user.fullName

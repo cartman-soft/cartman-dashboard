@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node tests/runTests.js",
+    "setup:auth": "node scripts/generateHash.js",
     "deploy:vercel": "vercel --prod"
   },
   "keywords": [],

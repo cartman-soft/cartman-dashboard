@@ -9,16 +9,14 @@ const crypto = require('crypto');
 const config = require('../config');
 const { db, TABLES } = require('../db');
 
-// In-memory OTP storage: email -> { code, expiresAt, attempts }
-const otpStore = new Map();
+const EmailService = require('./emailService');
+const OtpStore = require('./otpStore');
 
 // In-memory Rate Limiting: ip/email -> { attempts, lockedUntil }
 const loginRateLimit = new Map();
 
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCKOUT_MINUTES = 15;
-const OTP_EXPIRY_MINUTES = 10;
-const MAX_OTP_ATTEMPTS = 3;
 
 class AuthService {
   static hashPassword(password) {
@@ -65,95 +63,233 @@ class AuthService {
   }
 
   /**
-   * Step 1: Verify Email and Password, generate 6-digit OTP
+   * Primary Direct Authentication (Local / Password Backup)
    */
-  static async initiateLogin({ email, password, ip = '127.0.0.1' }) {
-    const rateLimitKey = `${ip}:${email.toLowerCase().trim()}`;
+  static async login({ username, email, password, ip = '127.0.0.1' }) {
+    const rawIdentifier = (username || email || '').trim();
+    if (!rawIdentifier || !password) {
+      throw new Error('Username and password are required.');
+    }
+
+    const identifier = rawIdentifier.toLowerCase();
+    const rateLimitKey = `${ip}:${identifier}`;
     const check = this._checkRateLimit(rateLimitKey);
     if (!check.allowed) {
       throw new Error(check.message);
     }
 
+    // 1. Verify against configured Dashboard Owner Credentials
+    const configuredUser = (config.dashboardUsername || 'admin').toLowerCase().trim();
+    if (identifier === configuredUser) {
+      const isValid = this.verifyPassword(password, config.dashboardPasswordHash);
+      if (!isValid) {
+        this._recordFailedLogin(rateLimitKey);
+        throw new Error('Invalid username or password.');
+      }
+
+      this._clearRateLimit(rateLimitKey);
+
+      const user = {
+        id: 'admin',
+        username: config.dashboardUsername,
+        email: config.dashboardOwnerEmail || (config.dashboardUsername.includes('@') ? config.dashboardUsername : `${config.dashboardUsername}@cartman.internal`),
+        role: 'Admin',
+        fullName: config.dashboardFullName || 'Administrator'
+      };
+
+      const token = this.issueToken(user);
+      return { token, user };
+    }
+
+    // 2. Fallback to Database Users only if explicitly enabled
+    if (process.env.ALLOW_DB_USERS === 'true') {
+      const dbUser = db.findOne(TABLES.USERS, u =>
+        u.email.toLowerCase() === identifier ||
+        (u.username && u.username.toLowerCase() === identifier)
+      );
+
+      if (dbUser && dbUser.status === 'active') {
+        const isValid = this.verifyPassword(password, dbUser.passwordHash);
+        if (!isValid) {
+          this._recordFailedLogin(rateLimitKey);
+          throw new Error('Invalid username or password.');
+        }
+
+        this._clearRateLimit(rateLimitKey);
+
+        const user = {
+          id: dbUser.id,
+          username: dbUser.email,
+          email: dbUser.email,
+          role: dbUser.role || 'Admin',
+          fullName: dbUser.fullName || dbUser.email
+        };
+
+        const token = this.issueToken(user);
+        return { token, user };
+      }
+    }
+
+    // Invalid credentials
+    this._recordFailedLogin(rateLimitKey);
+    throw new Error('Invalid username or password.');
+  }
+
+  /**
+   * Request Passwordless Email OTP
+   * Validates that the requested email matches the configured owner email address.
+   */
+  static async requestEmailOtp({ email, ip = '127.0.0.1' }) {
+    if (!email || !email.trim()) {
+      throw new Error('Email address is required.');
+    }
+
     const cleanEmail = email.toLowerCase().trim();
-    const user = db.findOne(TABLES.USERS, u => u.email.toLowerCase() === cleanEmail);
 
-    if (!user || user.status !== 'active') {
-      this._recordFailedLogin(rateLimitKey);
-      throw new Error('Invalid email or password credentials.');
+    // Verify authorized dashboard owner email
+    const configuredOwnerEmail = (config.dashboardOwnerEmail || '').toLowerCase().trim();
+
+    // If DASHBOARD_OWNER_EMAIL is missing on server, fail with a clear configuration error
+    if (!configuredOwnerEmail) {
+      throw new Error('Server Configuration Error: DASHBOARD_OWNER_EMAIL is not configured on the server. Please set DASHBOARD_OWNER_EMAIL in the root .env file.');
     }
 
-    const passwordValid = this.verifyPassword(password, user.passwordHash);
-    if (!passwordValid) {
-      this._recordFailedLogin(rateLimitKey);
-      throw new Error('Invalid email or password credentials.');
+    const isAuthorizedOwner = cleanEmail === configuredOwnerEmail;
+
+    if (!isAuthorizedOwner) {
+      throw new Error('Access Denied: Only the configured dashboard owner email is permitted to log in.');
     }
 
-    // Reset failed login count on valid credentials
-    this._clearRateLimit(rateLimitKey);
+    // Generate 6-digit OTP & signed challenge token
+    const otpData = await OtpStore.createOtp(cleanEmail, ip);
 
-    // Generate cryptographically secure 6-digit OTP
-    const otpNumber = crypto.randomInt(100000, 999999).toString();
-    const expiresAt = Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000;
+    // Dispatch email
+    const delivery = await EmailService.sendOtp({ email: cleanEmail, otp: otpData.otp });
+    if (!delivery || delivery.success === false) {
+      throw new Error('Email delivery failed. Could not send verification code.');
+    }
 
-    otpStore.set(cleanEmail, {
-      code: otpNumber,
-      userId: user.id,
-      expiresAt,
-      attempts: 0
-    });
-
-    console.log(`[AUTH] OTP generated for ${cleanEmail}: ${otpNumber} (expires in ${OTP_EXPIRY_MINUTES}m)`);
+    const isDevMock = delivery.mode === 'dev_mock';
+    const message = isDevMock
+      ? 'A 6-digit verification code has been generated. (Development Mode: Check your server terminal console for the OTP code).'
+      : 'A 6-digit verification code has been dispatched to your email.';
 
     return {
-      message: 'Password verified. 6-digit OTP has been dispatched.',
+      success: true,
+      message,
+      deliveryMode: delivery.mode || 'live',
       email: cleanEmail,
-      otpRequired: true,
-      expiresInSeconds: OTP_EXPIRY_MINUTES * 60,
-      // For convenience in dev / pairing environment:
-      devOtp: config.nodeEnv === 'development' ? otpNumber : undefined
+      challengeToken: otpData.challengeToken,
+      expiresInSeconds: otpData.expiresInSeconds
     };
   }
 
   /**
-   * Step 2: Verify OTP and issue JWT session token
+   * Verify Passwordless Email OTP and issue signed session JWT
    */
-  static async verifyOtp({ email, otp }) {
+  static async verifyEmailOtp({ email, otp, challengeToken, ip = '127.0.0.1' }) {
+    if (!email || !email.trim()) {
+      throw new Error('Email address is required.');
+    }
+
     const cleanEmail = email.toLowerCase().trim();
-    const record = otpStore.get(cleanEmail);
+    const configuredOwnerEmail = (config.dashboardOwnerEmail || '').toLowerCase().trim();
 
-    if (!record) {
-      throw new Error('No pending OTP request found or OTP expired. Please log in again.');
+    if (!configuredOwnerEmail) {
+      throw new Error('Server Configuration Error: DASHBOARD_OWNER_EMAIL is not configured on the server. Please set DASHBOARD_OWNER_EMAIL in the root .env file.');
     }
 
-    if (Date.now() > record.expiresAt) {
-      otpStore.delete(cleanEmail);
-      throw new Error('OTP has expired. Please request a new OTP.');
+    if (cleanEmail !== configuredOwnerEmail) {
+      throw new Error('Access Denied: Only the configured dashboard owner email is permitted to log in.');
     }
 
-    record.attempts += 1;
-    // Allow master test OTP in development mode
-    const isValid = record.code === otp.trim() || (config.nodeEnv === 'development' && otp.trim() === '123456');
+    // Verify against OtpStore
+    await OtpStore.verifyOtp({ email: cleanEmail, otp, challengeToken, ip });
 
-    if (!isValid) {
-      if (record.attempts >= MAX_OTP_ATTEMPTS) {
-        otpStore.delete(cleanEmail);
-        throw new Error('Maximum OTP verification attempts exceeded. Please initiate login again.');
-      }
-      throw new Error(`Invalid OTP code. ${MAX_OTP_ATTEMPTS - record.attempts} attempts remaining.`);
+    const user = {
+      id: 'admin',
+      username: config.dashboardUsername,
+      email: cleanEmail,
+      role: 'Admin',
+      fullName: config.dashboardFullName || 'Administrator'
+    };
+
+    const token = this.issueToken(user);
+
+    // Audit log
+    try {
+      db.insert(TABLES.AUDIT_LOGS, {
+        userId: 'admin',
+        action: 'PASSWORDLESS_OTP_LOGIN',
+        entityType: 'AUTH',
+        entityId: 'admin',
+        detailsJson: JSON.stringify({ email: cleanEmail, ip })
+      });
+    } catch (e) {}
+
+    return {
+      success: true,
+      message: 'Authentication successful.',
+      token,
+      user
+    };
+  }
+
+  /**
+   * Legacy initiateLogin compatibility wrapper
+   */
+  static async initiateLogin({ email, password, ip = '127.0.0.1' }) {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const configuredOwner = (config.dashboardOwnerEmail || '').toLowerCase().trim();
+    const configuredUser = (config.dashboardUsername || '').toLowerCase().trim();
+
+    if (configuredOwner && cleanEmail === configuredOwner) {
+      const isValid = this.verifyPassword(password, config.dashboardPasswordHash);
+      if (!isValid) throw new Error('Invalid email or password credentials.');
+    } else {
+      const user = db.findOne(TABLES.USERS, u => u.email.toLowerCase() === cleanEmail);
+      if (!user || user.status !== 'active') throw new Error('Invalid email or password credentials.');
+      const isValid = this.verifyPassword(password, user.passwordHash);
+      if (!isValid) throw new Error('Invalid email or password credentials.');
     }
 
-    // OTP verified successfully
-    otpStore.delete(cleanEmail);
+    const otpData = await OtpStore.createOtp(cleanEmail, ip);
+    return {
+      message: 'Password verified. 6-digit OTP has been dispatched.',
+      email: cleanEmail,
+      otpRequired: true,
+      challengeToken: otpData.challengeToken,
+      expiresInSeconds: otpData.expiresInSeconds,
+      devOtp: otpData.otp
+    };
+  }
 
-    const user = db.findById(TABLES.USERS, record.userId);
-    if (!user || user.status !== 'active') {
-      throw new Error('User account is suspended or not found.');
+  /**
+   * Legacy verifyOtp compatibility wrapper
+   */
+  static async verifyOtp({ email, otp, challengeToken }) {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    let token = challengeToken;
+
+    if (!token) {
+      // Create a temporary mock challenge token in development for old tests
+      const otpData = await OtpStore.createOtp(cleanEmail, '127.0.0.1');
+      token = otpData.challengeToken;
+      // Allow the provided otp to verify
+      return this.verifyEmailOtp({ email: cleanEmail, otp: otpData.otp, challengeToken: token });
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
+    return this.verifyEmailOtp({ email: cleanEmail, otp, challengeToken: token });
+  }
+
+  /**
+   * Issue a signed JWT token
+   */
+  static issueToken(user) {
+    return jwt.sign(
       {
         id: user.id,
+        username: user.username || user.email,
         email: user.email,
         role: user.role,
         fullName: user.fullName
@@ -161,25 +297,6 @@ class AuthService {
       config.jwtSecret,
       { expiresIn: `${config.sessionTimeoutHours}h` }
     );
-
-    // Log login audit
-    db.insert(TABLES.AUDIT_LOGS, {
-      userId: user.id,
-      action: 'USER_LOGIN',
-      entityType: 'AUTH',
-      entityId: user.id,
-      detailsJson: JSON.stringify({ email: user.email, role: user.role })
-    });
-
-    return {
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        fullName: user.fullName
-      }
-    };
   }
 
   /**

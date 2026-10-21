@@ -17,7 +17,8 @@ const API = {
 
   async request(endpoint, options = {}) {
     const method = (options.method || 'GET').toUpperCase();
-    if (window.isDemoMode && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    const isAuthEndpoint = typeof endpoint === 'string' && endpoint.startsWith('/api/auth');
+    if (!isAuthEndpoint && window.isDemoMode && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
       this.toast('Disabled in Public Demo: File uploads, imports, account edits, and data-changing actions are locked in demo mode.', 'error');
       throw new Error('Disabled in Public Demo: File uploads, imports, account edits, and data-changing actions are locked in demo mode.');
     }
@@ -43,11 +44,17 @@ const API = {
         if (window.AppState) {
           window.AppState.setUser(null);
         }
-        throw new Error('Your session has expired. Please log in again.');
+        if (window.CartmanInstance && typeof window.CartmanInstance.showLoginModal === 'function') {
+          window.CartmanInstance.showLoginModal();
+        }
+        throw new Error('Authentication required. Please log in.');
       }
 
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error(data.error || 'Requested service endpoint was not found (HTTP 404). Please ensure the backend server has been restarted with the latest routes.');
+        }
         throw new Error(data.error || `HTTP error ${response.status}`);
       }
       return data;
@@ -90,14 +97,19 @@ const API = {
 
   // Auth
   auth: {
-    login: (email, password) => API.request('/api/auth/login', {
+    requestOtp: (email) => API.request('/api/auth/request-otp', {
       method: 'POST',
-      body: JSON.stringify({ email, password })
+      body: JSON.stringify({ email })
     }),
-    verifyOtp: (email, otp) => API.request('/api/auth/verify-otp', {
+    verifyOtp: (email, otp, challengeToken) => API.request('/api/auth/verify-otp', {
       method: 'POST',
-      body: JSON.stringify({ email, otp })
+      body: JSON.stringify({ email, otp, challengeToken })
     }),
+    login: (username, password) => API.request('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password })
+    }),
+    logout: () => API.request('/api/auth/logout', { method: 'POST' }).catch(() => ({})),
     me: () => API.request('/api/auth/me')
   },
 
